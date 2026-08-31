@@ -2,9 +2,10 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$StatePath,
     [string]$PasswordUrl = '',
-    [string]$UpdateManifestUrl = '',
+    [string]$UpdateApiUrl = '',
+    [string]$UpdateContentsApiUrl = '',
     [string]$TargetDirectory = '',
-    [string]$UpdateVersionPath = '',
+    [string]$UpdateStatePath = '',
     [ValidateSet('Settings','Message','License','Update')]
     [string]$Mode = 'Settings',
     [int]$HostPid = 0,
@@ -67,62 +68,97 @@ function Save-RemoteUpdateFile {
     }
 }
 
-function Read-UpdateManifest {
-    param([string]$Path)
-
-    $values = @{}
-    $content = [IO.File]::ReadAllText($Path, [Text.Encoding]::UTF8)
-    foreach ($line in ($content -split "`r?`n")) {
-        $trimmed = $line.Trim().TrimStart([char]0xFEFF)
-        if ([string]::IsNullOrEmpty($trimmed) -or $trimmed.StartsWith('#') -or $trimmed.StartsWith(';')) { continue }
-        $colonIndex = $trimmed.IndexOf(':')
-        if ($colonIndex -lt 1) { continue }
-        $key = $trimmed.Substring(0, $colonIndex).Trim()
-        $value = $trimmed.Substring($colonIndex + 1).Trim()
-        if (-not [string]::IsNullOrEmpty($key)) { $values[$key] = $value }
-    }
-    return $values
-}
-
-function Convert-ToUpdateDate {
-    param([string]$Value)
-
-    $date = [DateTimeOffset]::MinValue
-    $ok = [DateTimeOffset]::TryParse(
-        $Value,
-        [Globalization.CultureInfo]::InvariantCulture,
-        [Globalization.DateTimeStyles]::AllowWhiteSpaces,
-        [ref]$date)
-    if ($ok) { return $date }
-    return $null
-}
-
 function Get-UpdateFileNames {
     return @('DG_DO_R05.vlx', 'DG_DT_TAVA_PALET.ps1', 'DG_WINDOWS_UI.ps1')
 }
 
-function Test-UpdateHashesValid {
-    param([hashtable]$Manifest)
+function Get-GitHubJson {
+    param([string]$Url)
 
-    foreach ($name in (Get-UpdateFileNames)) {
-        $hash = [string]$Manifest[$name]
-        if ($hash -notmatch '^[0-9A-Fa-f]{64}$') { return $false }
+    $uri = [Uri]$Url
+    if ($uri.IsFile) {
+        return ([IO.File]::ReadAllText($uri.LocalPath, [Text.Encoding]::UTF8) | ConvertFrom-Json)
     }
-    return $true
+
+    [Net.ServicePointManager]::SecurityProtocol =
+        [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    $headers = @{
+        'Accept' = 'application/vnd.github+json'
+        'X-GitHub-Api-Version' = '2022-11-28'
+    }
+    $separator = if ($Url.Contains('?')) { '&' } else { '?' }
+    $fetchUrl = $Url + $separator + 'kc_nonce=' + [DateTime]::UtcNow.Ticks
+    $response = Invoke-WebRequest -UseBasicParsing -Uri $fetchUrl -Headers $headers -UserAgent 'DEG-Auto-Update' -TimeoutSec 15
+    return ($response.Content | ConvertFrom-Json)
 }
 
-function Test-InstalledFilesMatchManifest {
+function Get-GitBlobSha {
+    param([string]$Path)
+
+    $bytes = [IO.File]::ReadAllBytes($Path)
+    $header = [Text.Encoding]::ASCII.GetBytes(('blob ' + $bytes.Length + [char]0))
+    $payload = New-Object byte[] ($header.Length + $bytes.Length)
+    [Array]::Copy($header, 0, $payload, 0, $header.Length)
+    [Array]::Copy($bytes, 0, $payload, $header.Length, $bytes.Length)
+    $sha1 = [Security.Cryptography.SHA1]::Create()
+    try {
+        return (($sha1.ComputeHash($payload) | ForEach-Object { $_.ToString('x2') }) -join '')
+    } finally {
+        $sha1.Dispose()
+    }
+}
+
+function Get-UpdateFileMetadata {
+    param([object[]]$Contents)
+
+    $metadata = @{}
+    foreach ($name in (Get-UpdateFileNames)) {
+        $item = @($Contents | Where-Object { [string]$_.name -ceq $name })
+        if ($item.Count -ne 1 -or
+            [string]$item[0].type -cne 'file' -or
+            [long]$item[0].size -le 0 -or
+            [string]::IsNullOrWhiteSpace([string]$item[0].download_url) -or
+            [string]$item[0].sha -notmatch '^[0-9A-Fa-f]{40}$') {
+            throw ($name + ' GitHub bilgisinde eksik veya gecersiz.')
+        }
+        $metadata[$name] = $item[0]
+    }
+    return $metadata
+}
+
+function Test-FileMatchesMetadata {
+    param(
+        [string]$Path,
+        [object]$Metadata
+    )
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
+    if ((Get-Item -LiteralPath $Path).Length -ne [long]$Metadata.size) { return $false }
+    return ((Get-GitBlobSha -Path $Path) -ceq ([string]$Metadata.sha).ToLowerInvariant())
+}
+
+function Test-InstalledFilesMatchMetadata {
     param(
         [string]$Directory,
-        [hashtable]$Manifest
+        [hashtable]$Metadata
     )
 
     foreach ($name in (Get-UpdateFileNames)) {
         $path = Join-Path $Directory $name
-        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $false }
-        if ((Get-FileHash -Algorithm SHA256 -LiteralPath $path).Hash -cne ([string]$Manifest[$name]).ToUpperInvariant()) { return $false }
+        if (-not (Test-FileMatchesMetadata -Path $path -Metadata $Metadata[$name])) { return $false }
     }
     return $true
+}
+
+function Test-PowerShellSyntax {
+    param([string]$Path)
+
+    $tokens = $null
+    $errors = $null
+    [void][Management.Automation.Language.Parser]::ParseFile($Path, [ref]$tokens, [ref]$errors)
+    if (@($errors).Count -gt 0) {
+        throw ((Split-Path -Leaf $Path) + ' PowerShell soz dizimi gecersiz.')
+    }
 }
 
 function Test-UpdateTargetWritable {
@@ -139,17 +175,17 @@ function Test-UpdateTargetWritable {
     }
 }
 
-function Write-UpdateVersion {
+function Write-UpdateCommit {
     param(
         [string]$Path,
-        [DateTimeOffset]$Date
+        [string]$CommitSha
     )
 
     $directory = Split-Path -Parent $Path
     if (-not [string]::IsNullOrWhiteSpace($directory)) {
         [void](New-Item -ItemType Directory -Path $directory -Force)
     }
-    [IO.File]::WriteAllText($Path, $Date.ToUniversalTime().ToString('o'), (New-Object Text.UTF8Encoding($false)))
+    [IO.File]::WriteAllText($Path, $CommitSha.ToLowerInvariant(), (New-Object Text.UTF8Encoding($false)))
 }
 
 function Install-StagedUpdate {
@@ -219,9 +255,10 @@ function Invoke-ElevatedUpdate {
     $arguments =
         '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File ' + (Quote-ProcessArgument $PSCommandPath) +
         ' -Mode Update -StatePath ' + (Quote-ProcessArgument $StatePath) +
-        ' -UpdateManifestUrl ' + (Quote-ProcessArgument $UpdateManifestUrl) +
+        ' -UpdateApiUrl ' + (Quote-ProcessArgument $UpdateApiUrl) +
+        ' -UpdateContentsApiUrl ' + (Quote-ProcessArgument $UpdateContentsApiUrl) +
         ' -TargetDirectory ' + (Quote-ProcessArgument $TargetDirectory) +
-        ' -UpdateVersionPath ' + (Quote-ProcessArgument $UpdateVersionPath) +
+        ' -UpdateStatePath ' + (Quote-ProcessArgument $UpdateStatePath) +
         ' -ElevatedUpdate'
     $process = Start-Process -FilePath 'powershell.exe' -ArgumentList $arguments -Verb RunAs -Wait -PassThru -WindowStyle Hidden
     if ($process.ExitCode -ne 0 -and -not (Test-Path -LiteralPath ($StatePath + '.result'))) {
@@ -235,63 +272,66 @@ function Invoke-DegUpdate {
         Remove-Item -LiteralPath $resultPath -Force -ErrorAction SilentlyContinue
     }
 
-    if ([string]::IsNullOrWhiteSpace($UpdateManifestUrl) -or
+    if ([string]::IsNullOrWhiteSpace($UpdateApiUrl) -or
+        [string]::IsNullOrWhiteSpace($UpdateContentsApiUrl) -or
         [string]::IsNullOrWhiteSpace($TargetDirectory) -or
-        [string]::IsNullOrWhiteSpace($UpdateVersionPath) -or
+        [string]::IsNullOrWhiteSpace($UpdateStatePath) -or
         -not (Test-Path -LiteralPath $TargetDirectory -PathType Container)) {
         Write-UpdateResult 'FAILED|Guncelleme yolu gecersiz.'
         return
     }
 
-    if (-not (Test-UpdateTargetWritable -Directory $TargetDirectory)) {
-        if (-not $ElevatedUpdate) {
-            try { Invoke-ElevatedUpdate } catch { Write-UpdateResult 'FAILED|Yonetici izni reddedildi.' }
-        } else {
-            Write-UpdateResult 'FAILED|Hedef klasore yazilamadi.'
-        }
-        return
-    }
-
     $stageDirectory = Join-Path $env:TEMP ('DEG_update_' + [guid]::NewGuid().ToString('N'))
     try {
+        $commits = @(Get-GitHubJson -Url $UpdateApiUrl)
+        if ($commits.Count -lt 1 -or [string]$commits[0].sha -notmatch '^[0-9A-Fa-f]{40,64}$') {
+            throw 'GitHub guncelleme commit bilgisi gecersiz.'
+        }
+        $remoteCommit = ([string]$commits[0].sha).ToLowerInvariant()
+
+        $localCommit = ''
+        if (Test-Path -LiteralPath $UpdateStatePath -PathType Leaf) {
+            $localCommit = [IO.File]::ReadAllText($UpdateStatePath).Trim().ToLowerInvariant()
+        }
+        if ($localCommit -ceq $remoteCommit) {
+            Write-UpdateResult ('CURRENT|' + $remoteCommit)
+            return
+        }
+
+        $contentsSeparator = if ($UpdateContentsApiUrl.Contains('?')) { '&' } else { '?' }
+        $contentsUrl = $UpdateContentsApiUrl + $contentsSeparator + 'ref=' + [Uri]::EscapeDataString($remoteCommit)
+        $metadata = Get-UpdateFileMetadata -Contents @(Get-GitHubJson -Url $contentsUrl)
+
+        if ([string]::IsNullOrWhiteSpace($localCommit) -and
+            (Test-InstalledFilesMatchMetadata -Directory $TargetDirectory -Metadata $metadata)) {
+            Write-UpdateCommit -Path $UpdateStatePath -CommitSha $remoteCommit
+            Write-UpdateResult ('CURRENT|' + $remoteCommit)
+            return
+        }
+
+        if (-not (Test-UpdateTargetWritable -Directory $TargetDirectory)) {
+            if (-not $ElevatedUpdate) {
+                try { Invoke-ElevatedUpdate } catch { Write-UpdateResult 'FAILED|Yonetici izni reddedildi.' }
+            } else {
+                Write-UpdateResult 'FAILED|Hedef klasore yazilamadi.'
+            }
+            return
+        }
+
         [void](New-Item -ItemType Directory -Path $stageDirectory -Force)
-        $manifestPath = Join-Path $stageDirectory 'guncelleme.txt'
-        Save-RemoteUpdateFile -Url $UpdateManifestUrl -Destination $manifestPath
-        $manifest = Read-UpdateManifest -Path $manifestPath
-        $remoteDate = Convert-ToUpdateDate -Value ([string]$manifest['SURUM_TARIHI'])
-        if ($null -eq $remoteDate -or -not (Test-UpdateHashesValid -Manifest $manifest)) {
-            throw 'Manifest tarihi veya SHA256 degerleri gecersiz.'
-        }
-
-        $localDate = $null
-        if (Test-Path -LiteralPath $UpdateVersionPath -PathType Leaf) {
-            $localDate = Convert-ToUpdateDate -Value ([IO.File]::ReadAllText($UpdateVersionPath).Trim())
-        }
-        if ($null -ne $localDate -and $remoteDate -le $localDate) {
-            Write-UpdateResult ('CURRENT|' + $remoteDate.ToUniversalTime().ToString('o'))
-            return
-        }
-
-        if ($null -eq $localDate -and (Test-InstalledFilesMatchManifest -Directory $TargetDirectory -Manifest $manifest)) {
-            Write-UpdateVersion -Path $UpdateVersionPath -Date $remoteDate
-            Write-UpdateResult ('CURRENT|' + $remoteDate.ToUniversalTime().ToString('o'))
-            return
-        }
-
-        $manifestUri = [Uri]$UpdateManifestUrl
         foreach ($name in (Get-UpdateFileNames)) {
-            $fileUrl = ([Uri]::new($manifestUri, $name)).AbsoluteUri
             $destination = Join-Path $stageDirectory $name
-            Save-RemoteUpdateFile -Url $fileUrl -Destination $destination
-            $actualHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $destination).Hash
-            if ($actualHash -cne ([string]$manifest[$name]).ToUpperInvariant()) {
-                throw ($name + ' SHA256 dogrulamasi basarisiz.')
+            Save-RemoteUpdateFile -Url ([string]$metadata[$name].download_url) -Destination $destination
+            if (-not (Test-FileMatchesMetadata -Path $destination -Metadata $metadata[$name])) {
+                throw ($name + ' Git blob SHA dogrulamasi basarisiz.')
             }
         }
+        Test-PowerShellSyntax -Path (Join-Path $stageDirectory 'DG_DT_TAVA_PALET.ps1')
+        Test-PowerShellSyntax -Path (Join-Path $stageDirectory 'DG_WINDOWS_UI.ps1')
 
         Install-StagedUpdate -StageDirectory $stageDirectory -Directory $TargetDirectory
-        Write-UpdateVersion -Path $UpdateVersionPath -Date $remoteDate
-        Write-UpdateResult ('UPDATED|' + $remoteDate.ToUniversalTime().ToString('o'))
+        Write-UpdateCommit -Path $UpdateStatePath -CommitSha $remoteCommit
+        Write-UpdateResult ('UPDATED|' + $remoteCommit)
     } catch {
         try { [IO.File]::WriteAllText($LogPath, ($_ | Out-String), (New-Object Text.UTF8Encoding($false))) } catch { }
         Write-UpdateResult 'FAILED|Guncelleme tamamlanamadi.'
