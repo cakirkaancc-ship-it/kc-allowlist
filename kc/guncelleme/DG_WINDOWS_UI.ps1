@@ -113,7 +113,7 @@ function Get-UpdateFileMetadata {
 
     $metadata = @{}
     foreach ($name in (Get-UpdateFileNames)) {
-        $item = @($Contents | Where-Object { [string]$_.name -ceq $name })
+        $item = @($Contents | Where-Object { [string]$_.name -ieq $name })
         if ($item.Count -ne 1 -or
             [string]$item[0].type -cne 'file' -or
             [long]$item[0].size -le 0 -or
