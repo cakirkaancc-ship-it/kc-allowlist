@@ -736,13 +736,13 @@ function Get-LicensePasswordFromText {
 
     if ([string]::IsNullOrEmpty($Content)) { return $null }
 
-    $expectedLabel = ([char]0x015E).ToString() + ([char]0x0130).ToString() + 'FRE'
     foreach ($line in ($Content -split "`r?`n")) {
         $colonIndex = $line.IndexOf(':')
         if ($colonIndex -lt 0) { continue }
 
         $label = $line.Substring(0, $colonIndex).Trim().TrimStart([char]0xFEFF)
-        if ($label -cne $expectedLabel) { continue }
+        $normalizedLabel = $label.ToUpperInvariant().Replace([char]0x015E, 'S').Replace([char]0x0130, 'I')
+        if ($normalizedLabel -cne 'SIFRE') { continue }
 
         $value = $line.Substring($colonIndex + 1).Trim()
         if (-not [string]::IsNullOrEmpty($value)) { return $value }
