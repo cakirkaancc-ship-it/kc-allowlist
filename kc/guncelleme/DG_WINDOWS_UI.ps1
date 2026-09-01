@@ -11,6 +11,8 @@ param(
     [int]$HostPid = 0,
     [long]$HostHwnd = 0,
     [switch]$ElevatedUpdate,
+    [switch]$ShowProgress,
+    [string]$UpdateUserSid = '',
     [switch]$SelfTest
 )
 
@@ -26,6 +28,87 @@ function Write-UpdateResult {
     [IO.File]::WriteAllText($StatePath + '.result', $Value, (New-Object Text.UTF8Encoding($false)))
 }
 
+$script:UpdateWindow = $null
+$script:UpdateStatus = $null
+$script:UpdateDetail = $null
+$script:UpdateBar = $null
+$script:UpdateDownloadedBytes = [long]0
+$script:UpdateTotalBytes = [long]0
+
+function Initialize-UpdateProgressWindow {
+    if (-not $ShowProgress) { return }
+    Add-Type -AssemblyName PresentationFramework
+    Add-Type -AssemblyName PresentationCore
+    Add-Type -AssemblyName WindowsBase
+    $xaml = @'
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="DEG Guncelleme" Width="520" Height="210"
+        WindowStartupLocation="CenterScreen" ResizeMode="NoResize"
+        Topmost="True" ShowInTaskbar="True" Background="#F8FAFC">
+  <Grid Margin="22">
+    <Grid.RowDefinitions>
+      <RowDefinition Height="Auto"/>
+      <RowDefinition Height="Auto"/>
+      <RowDefinition Height="Auto"/>
+      <RowDefinition Height="*"/>
+    </Grid.RowDefinitions>
+    <TextBlock Text="DEG guncelleniyor" FontSize="20" FontWeight="SemiBold" Foreground="#111827"/>
+    <TextBlock x:Name="StatusText" Grid.Row="1" Margin="0,16,0,8" Text="Hazirlaniyor..." FontSize="14" Foreground="#1F2937"/>
+    <ProgressBar x:Name="ProgressBar" Grid.Row="2" Height="18" Minimum="0" Maximum="100" Value="0"/>
+    <TextBlock x:Name="DetailText" Grid.Row="3" Margin="0,9,0,0" Text="" FontSize="12" Foreground="#64748B" TextWrapping="Wrap"/>
+  </Grid>
+</Window>
+'@
+    $reader = New-Object Xml.XmlNodeReader ([xml]$xaml)
+    $script:UpdateWindow = [Windows.Markup.XamlReader]::Load($reader)
+    $script:UpdateStatus = $script:UpdateWindow.FindName('StatusText')
+    $script:UpdateDetail = $script:UpdateWindow.FindName('DetailText')
+    $script:UpdateBar = $script:UpdateWindow.FindName('ProgressBar')
+    [void]$script:UpdateWindow.Show()
+    [void]$script:UpdateWindow.Dispatcher.Invoke([Action]{}, [Windows.Threading.DispatcherPriority]::Render)
+}
+
+function Set-UpdateProgress {
+    param(
+        [string]$Status,
+        [int]$Value,
+        [string]$Detail = ''
+    )
+    if ($null -eq $script:UpdateWindow) { return }
+    $script:UpdateStatus.Text = $Status
+    $script:UpdateDetail.Text = $Detail
+    $script:UpdateBar.Value = [Math]::Max(0, [Math]::Min(100, $Value))
+    [void]$script:UpdateWindow.Dispatcher.Invoke([Action]{}, [Windows.Threading.DispatcherPriority]::Render)
+}
+
+function Close-UpdateProgressWindow {
+    if ($null -ne $script:UpdateWindow) {
+        try { $script:UpdateWindow.Close() } catch { }
+    }
+    $script:UpdateWindow = $null
+    $script:UpdateStatus = $null
+    $script:UpdateDetail = $null
+    $script:UpdateBar = $null
+}
+
+function Finish-UpdateProgressWindow {
+    if ($null -eq $script:UpdateWindow) { return }
+    $resultPath = $StatePath + '.result'
+    $result = if (Test-Path -LiteralPath $resultPath) { [IO.File]::ReadAllText($resultPath).Trim() } else { 'FAILED|RESULT_MISSING' }
+    if ($result -like 'UPDATED|*') {
+        Set-UpdateProgress -Status 'Guncelleme tamamlandi' -Value 100 -Detail 'CAD programini yeniden baslatin.'
+        Start-Sleep -Milliseconds 900
+    } elseif ($result -like 'CURRENT|*') {
+        Set-UpdateProgress -Status 'Dosyalar zaten guncel' -Value 100 -Detail ''
+        Start-Sleep -Milliseconds 700
+    } else {
+        Set-UpdateProgress -Status 'Guncelleme tamamlanamadi' -Value 100 -Detail 'Ayrintilar guncelleme gunlugune yazildi.'
+        Start-Sleep -Milliseconds 1600
+    }
+    Close-UpdateProgressWindow
+}
+
 function Quote-ProcessArgument {
     param([string]$Value)
     return '"' + $Value.Replace('"', '\"') + '"'
@@ -34,7 +117,8 @@ function Quote-ProcessArgument {
 function Save-RemoteUpdateFile {
     param(
         [string]$Url,
-        [string]$Destination
+        [string]$Destination,
+        [string]$DisplayName = ''
     )
 
     $uri = [Uri]$Url
@@ -60,7 +144,17 @@ function Save-RemoteUpdateFile {
         $response = $request.GetResponse()
         $inputStream = $response.GetResponseStream()
         $outputStream = [IO.File]::Open($Destination, [IO.FileMode]::Create, [IO.FileAccess]::Write, [IO.FileShare]::None)
-        $inputStream.CopyTo($outputStream)
+        $buffer = New-Object byte[] 65536
+        while (($read = $inputStream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+            $outputStream.Write($buffer, 0, $read)
+            $script:UpdateDownloadedBytes += [long]$read
+            if ($script:UpdateTotalBytes -gt 0) {
+                $ratio = [Math]::Min(1.0, [double]$script:UpdateDownloadedBytes / [double]$script:UpdateTotalBytes)
+                $value = 30 + [int][Math]::Floor(45.0 * $ratio)
+                $detail = ('{0:N1} / {1:N1} MB' -f ($script:UpdateDownloadedBytes / 1MB), ($script:UpdateTotalBytes / 1MB))
+                Set-UpdateProgress -Status ('Indiriliyor: ' + $DisplayName) -Value $value -Detail $detail
+            }
+        }
     } finally {
         if ($null -ne $outputStream) { $outputStream.Dispose() }
         if ($null -ne $inputStream) { $inputStream.Dispose() }
@@ -175,6 +269,25 @@ function Test-UpdateTargetWritable {
     }
 }
 
+function Grant-UpdateTargetWriteAccess {
+    param(
+        [string]$Directory,
+        [string]$UserSid
+    )
+
+    if ([string]::IsNullOrWhiteSpace($UserSid)) {
+        $UserSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    }
+    $identity = New-Object Security.Principal.SecurityIdentifier($UserSid)
+    $rights = [Security.AccessControl.FileSystemRights]::Modify
+    $inheritance = [Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
+    $propagation = [Security.AccessControl.PropagationFlags]::None
+    $rule = New-Object Security.AccessControl.FileSystemAccessRule($identity, $rights, $inheritance, $propagation, [Security.AccessControl.AccessControlType]::Allow)
+    $acl = Get-Acl -LiteralPath $Directory
+    $acl.SetAccessRule($rule)
+    Set-Acl -LiteralPath $Directory -AclObject $acl
+}
+
 function Write-UpdateCommit {
     param(
         [string]$Path,
@@ -252,6 +365,7 @@ function Install-StagedUpdate {
 }
 
 function Invoke-ElevatedUpdate {
+    $requestingUserSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
     $arguments =
         '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File ' + (Quote-ProcessArgument $PSCommandPath) +
         ' -Mode Update -StatePath ' + (Quote-ProcessArgument $StatePath) +
@@ -259,7 +373,14 @@ function Invoke-ElevatedUpdate {
         ' -UpdateContentsApiUrl ' + (Quote-ProcessArgument $UpdateContentsApiUrl) +
         ' -TargetDirectory ' + (Quote-ProcessArgument $TargetDirectory) +
         ' -UpdateStatePath ' + (Quote-ProcessArgument $UpdateStatePath) +
+        ' -UpdateUserSid ' + (Quote-ProcessArgument $requestingUserSid) +
         ' -ElevatedUpdate'
+    if ($ShowProgress) { $arguments += ' -ShowProgress' }
+    if ($ShowProgress) {
+        Set-UpdateProgress -Status 'Yonetici izni bekleniyor' -Value 24 -Detail 'Bu izin yalnizca sonraki guncellemeleri izinsiz yapabilmek icin bir kez gereklidir.'
+        Start-Sleep -Milliseconds 250
+        Close-UpdateProgressWindow
+    }
     $process = Start-Process -FilePath 'powershell.exe' -ArgumentList $arguments -Verb RunAs -Wait -PassThru -WindowStyle Hidden
     if ($process.ExitCode -ne 0 -and -not (Test-Path -LiteralPath ($StatePath + '.result'))) {
         Write-UpdateResult 'FAILED|Yonetici yetkisi alinamadi.'
@@ -283,6 +404,7 @@ function Invoke-DegUpdate {
 
     $stageDirectory = Join-Path $env:TEMP ('DEG_update_' + [guid]::NewGuid().ToString('N'))
     try {
+        Set-UpdateProgress -Status 'Guncelleme bilgisi kontrol ediliyor' -Value 5 -Detail 'GitHub baglantisi kuruluyor...'
         $commits = @(Get-GitHubJson -Url $UpdateApiUrl)
         if ($commits.Count -lt 1 -or [string]$commits[0].sha -notmatch '^[0-9A-Fa-f]{40,64}$') {
             throw 'GitHub guncelleme commit bilgisi gecersiz.'
@@ -298,6 +420,7 @@ function Invoke-DegUpdate {
             return
         }
 
+        Set-UpdateProgress -Status 'Dosya listesi aliniyor' -Value 15 -Detail 'Yeni surum bulundu.'
         $contentsSeparator = if ($UpdateContentsApiUrl.Contains('?')) { '&' } else { '?' }
         $contentsUrl = $UpdateContentsApiUrl + $contentsSeparator + 'ref=' + [Uri]::EscapeDataString($remoteCommit)
         $metadata = Get-UpdateFileMetadata -Contents @(Get-GitHubJson -Url $contentsUrl)
@@ -309,6 +432,10 @@ function Invoke-DegUpdate {
             return
         }
 
+        if ($ElevatedUpdate) {
+            try { Grant-UpdateTargetWriteAccess -Directory $TargetDirectory -UserSid $UpdateUserSid } catch { }
+        }
+        Set-UpdateProgress -Status 'Kurulum klasoru denetleniyor' -Value 24 -Detail $TargetDirectory
         if (-not (Test-UpdateTargetWritable -Directory $TargetDirectory)) {
             if (-not $ElevatedUpdate) {
                 try { Invoke-ElevatedUpdate } catch { Write-UpdateResult 'FAILED|Yonetici izni reddedildi.' }
@@ -319,17 +446,22 @@ function Invoke-DegUpdate {
         }
 
         [void](New-Item -ItemType Directory -Path $stageDirectory -Force)
+        $script:UpdateDownloadedBytes = [long]0
+        $script:UpdateTotalBytes = [long](($metadata.Values | Measure-Object -Property size -Sum).Sum)
         foreach ($name in (Get-UpdateFileNames)) {
             $destination = Join-Path $stageDirectory $name
-            Save-RemoteUpdateFile -Url ([string]$metadata[$name].download_url) -Destination $destination
+            Save-RemoteUpdateFile -Url ([string]$metadata[$name].download_url) -Destination $destination -DisplayName $name
             if (-not (Test-FileMatchesMetadata -Path $destination -Metadata $metadata[$name])) {
                 throw ($name + ' Git blob SHA dogrulamasi basarisiz.')
             }
         }
+        Set-UpdateProgress -Status 'Dosyalar dogrulaniyor' -Value 78 -Detail 'SHA ve PowerShell kontrolleri yapiliyor.'
         Test-PowerShellSyntax -Path (Join-Path $stageDirectory 'DG_DT_TAVA_PALET.ps1')
         Test-PowerShellSyntax -Path (Join-Path $stageDirectory 'DG_WINDOWS_UI.ps1')
 
+        Set-UpdateProgress -Status 'Yeni surum kuruluyor' -Value 88 -Detail $TargetDirectory
         Install-StagedUpdate -StageDirectory $stageDirectory -Directory $TargetDirectory
+        Set-UpdateProgress -Status 'Kurulum kaydi tamamlanıyor' -Value 96 -Detail ''
         Write-UpdateCommit -Path $UpdateStatePath -CommitSha $remoteCommit
         Write-UpdateResult ('UPDATED|' + $remoteCommit)
     } catch {
@@ -343,7 +475,12 @@ function Invoke-DegUpdate {
 }
 
 if ($Mode -eq 'Update') {
-    Invoke-DegUpdate
+    if ($ShowProgress) { Initialize-UpdateProgressWindow }
+    try {
+        Invoke-DegUpdate
+    } finally {
+        if ($ShowProgress) { Finish-UpdateProgressWindow }
+    }
     exit 0
 }
 
