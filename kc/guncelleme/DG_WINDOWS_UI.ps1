@@ -9,7 +9,10 @@ param(
     [string]$UpdateRawBaseUrl = '',
     [string]$TargetDirectory = '',
     [string]$UpdateStatePath = '',
-    [ValidateSet('Settings','Message','License','DeviceCode','Update')]
+    [string]$PendingDirectory = '',
+    [string]$PendingVersion = '',
+    [int]$WaitForPid = 0,
+    [ValidateSet('Settings','Message','License','DeviceCode','Update','ApplyPending')]
     [string]$Mode = 'Settings',
     [int]$HostPid = 0,
     [long]$HostHwnd = 0,
@@ -272,7 +275,10 @@ function Finish-UpdateProgressWindow {
     if ($null -eq $script:UpdateWindow) { return }
     $resultPath = $StatePath + '.result'
     $result = if (Test-Path -LiteralPath $resultPath) { [IO.File]::ReadAllText($resultPath).Trim() } else { 'FAILED|RESULT_MISSING' }
-    if ($result -like 'UPDATED|*') {
+    if ($result -like 'UPDATED|PENDING|*') {
+        Set-UpdateProgress -Status 'Dosyalar indirildi' -Value 100 -Detail 'Kurulum CAD kapatildiginda otomatik tamamlanacak.'
+        Start-Sleep -Milliseconds 1200
+    } elseif ($result -like 'UPDATED|*') {
         Set-UpdateProgress -Status 'Guncelleme tamamlandi' -Value 100 -Detail 'CAD programini yeniden baslatin.'
         Start-Sleep -Milliseconds 900
     } elseif ($result -like 'CURRENT|*') {
@@ -475,9 +481,13 @@ function Test-FileMatchesMetadata {
         [object]$Metadata
     )
 
-    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
-    if ((Get-Item -LiteralPath $Path).Length -ne [long]$Metadata.size) { return $false }
-    return ((Get-GitBlobSha -Path $Path) -ceq ([string]$Metadata.sha).ToLowerInvariant())
+    try {
+        if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
+        if ((Get-Item -LiteralPath $Path).Length -ne [long]$Metadata.size) { return $false }
+        return ((Get-GitBlobSha -Path $Path) -ceq ([string]$Metadata.sha).ToLowerInvariant())
+    } catch {
+        return $false
+    }
 }
 
 function Test-InstalledFilesMatchMetadata {
@@ -555,14 +565,18 @@ function Test-StagedFilesMatchInstalled {
         [string]$Directory
     )
 
-    foreach ($name in (Get-UpdateFileNames)) {
-        $staged = Join-Path $StageDirectory $name
-        $installed = Join-Path $Directory $name
-        if (-not (Test-Path -LiteralPath $installed -PathType Leaf)) { return $false }
-        if ((Get-Item -LiteralPath $staged).Length -ne (Get-Item -LiteralPath $installed).Length) { return $false }
-        if ((Get-FileSha256 -Path $staged) -cne (Get-FileSha256 -Path $installed)) { return $false }
+    try {
+        foreach ($name in (Get-UpdateFileNames)) {
+            $staged = Join-Path $StageDirectory $name
+            $installed = Join-Path $Directory $name
+            if (-not (Test-Path -LiteralPath $installed -PathType Leaf)) { return $false }
+            if ((Get-Item -LiteralPath $staged).Length -ne (Get-Item -LiteralPath $installed).Length) { return $false }
+            if ((Get-FileSha256 -Path $staged) -cne (Get-FileSha256 -Path $installed)) { return $false }
+        }
+        return $true
+    } catch {
+        return $false
     }
-    return $true
 }
 
 function Test-StagedUpdateFiles {
@@ -656,6 +670,67 @@ function Write-UpdateCommit {
     [IO.File]::WriteAllText($Path, $CommitSha.ToLowerInvariant(), (New-Object Text.UTF8Encoding($false)))
 }
 
+function Get-DeepestException {
+    param([object]$ErrorRecord)
+
+    $exception = if ($null -ne $ErrorRecord -and $null -ne $ErrorRecord.Exception) {
+        $ErrorRecord.Exception
+    } elseif ($ErrorRecord -is [Exception]) {
+        $ErrorRecord
+    } else {
+        $null
+    }
+    while ($null -ne $exception -and $null -ne $exception.InnerException) {
+        $exception = $exception.InnerException
+    }
+    return $exception
+}
+
+function Remove-FileReadOnlyAttribute {
+    param([string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return }
+    $attributes = [IO.File]::GetAttributes($Path)
+    if (($attributes -band [IO.FileAttributes]::ReadOnly) -ne 0) {
+        [IO.File]::SetAttributes($Path, ($attributes -band (-bnot [IO.FileAttributes]::ReadOnly)))
+    }
+}
+
+function Install-OneStagedFile {
+    param([object]$Record)
+
+    $lastError = $null
+    for ($attempt = 1; $attempt -le 6; $attempt++) {
+        try {
+            if ($Record.HadOriginal) {
+                Remove-FileReadOnlyAttribute -Path $Record.Target
+                try {
+                    [IO.File]::Replace($Record.Incoming, $Record.Target, $null, $true)
+                } catch {
+                    [IO.File]::Copy($Record.Incoming, $Record.Target, $true)
+                    Remove-Item -LiteralPath $Record.Incoming -Force -ErrorAction SilentlyContinue
+                }
+            } else {
+                Move-Item -LiteralPath $Record.Incoming -Destination $Record.Target -Force
+            }
+            return
+        } catch {
+            $lastError = $_
+            if ($attempt -lt 6) { Start-Sleep -Milliseconds (350 * $attempt) }
+        }
+    }
+
+    $deepest = Get-DeepestException -ErrorRecord $lastError
+    $message = $Record.Name + ' kurulamadi: ' + $(if ($null -ne $deepest) { $deepest.Message } else { [string]$lastError })
+    if ($deepest -is [UnauthorizedAccessException]) {
+        throw [UnauthorizedAccessException]::new($message, $deepest)
+    }
+    if ($deepest -is [IO.IOException]) {
+        throw [IO.IOException]::new($message, $deepest)
+    }
+    throw $message
+}
+
 function Install-StagedUpdate {
     param(
         [string]$StageDirectory,
@@ -674,6 +749,7 @@ function Install-StagedUpdate {
             Copy-Item -LiteralPath (Join-Path $StageDirectory $name) -Destination $incoming -Force
             if ($hadOriginal) { Copy-Item -LiteralPath $target -Destination $backup -Force }
             $records += [pscustomobject]@{
+                Name = $name
                 Target = $target
                 Incoming = $incoming
                 Backup = $backup
@@ -683,17 +759,8 @@ function Install-StagedUpdate {
         }
 
         foreach ($record in $records) {
+            Install-OneStagedFile -Record $record
             $record.Installed = $true
-            if ($record.HadOriginal) {
-                try {
-                    [IO.File]::Replace($record.Incoming, $record.Target, $null, $true)
-                } catch {
-                    [IO.File]::Copy($record.Incoming, $record.Target, $true)
-                    Remove-Item -LiteralPath $record.Incoming -Force -ErrorAction SilentlyContinue
-                }
-            } else {
-                Move-Item -LiteralPath $record.Incoming -Destination $record.Target -Force
-            }
         }
         $success = $true
     } catch {
@@ -715,6 +782,127 @@ function Install-StagedUpdate {
         foreach ($record in $records) {
             if (Test-Path -LiteralPath $record.Incoming) { Remove-Item -LiteralPath $record.Incoming -Force -ErrorAction SilentlyContinue }
             if ($success -and (Test-Path -LiteralPath $record.Backup)) { Remove-Item -LiteralPath $record.Backup -Force -ErrorAction SilentlyContinue }
+        }
+    }
+}
+
+function Test-DeferredInstallCandidate {
+    param([object]$ErrorRecord)
+
+    $exception = if ($null -ne $ErrorRecord) { $ErrorRecord.Exception } else { $null }
+    while ($null -ne $exception) {
+        if ($exception -is [UnauthorizedAccessException]) { return $false }
+        if ($exception -is [IO.IOException]) { return $true }
+        $exception = $exception.InnerException
+    }
+    return $false
+}
+
+function Get-UpdateHostProcessId {
+    if ($HostPid -gt 0) { return $HostPid }
+
+    try {
+        $processId = $PID
+        for ($depth = 0; $depth -lt 5; $depth++) {
+            $processInfo = Get-CimInstance Win32_Process -Filter ('ProcessId=' + $processId) -ErrorAction Stop
+            $processId = [int]$processInfo.ParentProcessId
+            if ($processId -le 0) { break }
+            $parent = Get-Process -Id $processId -ErrorAction Stop
+            if ($parent.ProcessName -match '^(acad|gcad|gstarcad)$') { return $processId }
+        }
+    } catch { }
+    return 0
+}
+
+function Get-PendingUpdateArguments {
+    param(
+        [string]$ScriptPath,
+        [string]$PendingPath,
+        [string]$Version,
+        [int]$CadProcessId
+    )
+
+    return (
+        '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File ' + (Quote-ProcessArgument $ScriptPath) +
+        ' -Mode ApplyPending -StatePath ' + (Quote-ProcessArgument (Join-Path $PendingPath 'apply.state')) +
+        ' -TargetDirectory ' + (Quote-ProcessArgument $TargetDirectory) +
+        ' -UpdateStatePath ' + (Quote-ProcessArgument $UpdateStatePath) +
+        ' -PendingDirectory ' + (Quote-ProcessArgument $PendingPath) +
+        ' -PendingVersion ' + (Quote-ProcessArgument $Version) +
+        ' -WaitForPid ' + $CadProcessId)
+}
+
+function Queue-PendingUpdate {
+    param(
+        [string]$StageDirectory,
+        [string]$Version
+    )
+
+    $pendingPath = Join-Path $TargetDirectory ('.deg_update_pending_' + [guid]::NewGuid().ToString('N'))
+    [void](New-Item -ItemType Directory -Path $pendingPath -Force)
+    foreach ($name in (Get-UpdateFileNames)) {
+        Copy-Item -LiteralPath (Join-Path $StageDirectory $name) -Destination (Join-Path $pendingPath $name) -Force
+    }
+    Test-StagedUpdateFiles -StageDirectory $pendingPath
+
+    $pendingScript = Join-Path $pendingPath 'DG_WINDOWS_UI.ps1'
+    $cadProcessId = Get-UpdateHostProcessId
+    $arguments = Get-PendingUpdateArguments -ScriptPath $pendingScript -PendingPath $pendingPath -Version $Version -CadProcessId $cadProcessId
+    $runOnceRegistered = $false
+    $helperStarted = $false
+    $runOncePath = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\RunOnce'
+    try {
+        [void](New-Item -Path $runOncePath -Force)
+        Set-ItemProperty -Path $runOncePath -Name 'DEG_Pending_Update' -Value ('powershell.exe ' + $arguments) -Force
+        $runOnceRegistered = $true
+    } catch { }
+    try {
+        [void](Start-Process -FilePath 'powershell.exe' -ArgumentList $arguments -WindowStyle Hidden -PassThru)
+        $helperStarted = $true
+    } catch { }
+    if (-not $runOnceRegistered -and -not $helperStarted) {
+        throw 'Bekleyen guncelleme icin arka plan kurucusu baslatilamadi.'
+    }
+    return $pendingPath
+}
+
+function Invoke-PendingUpdate {
+    if ([string]::IsNullOrWhiteSpace($PendingDirectory) -or
+        [string]::IsNullOrWhiteSpace($TargetDirectory) -or
+        [string]::IsNullOrWhiteSpace($PendingVersion) -or
+        -not (Test-Path -LiteralPath $PendingDirectory -PathType Container) -or
+        -not (Test-Path -LiteralPath $TargetDirectory -PathType Container)) {
+        Write-UpdateResult 'FAILED|Bekleyen guncelleme bilgisi gecersiz.'
+        return
+    }
+
+    if ($WaitForPid -gt 0) {
+        try {
+            $waitProcess = Get-Process -Id $WaitForPid -ErrorAction Stop
+            $waitProcess.WaitForExit()
+        } catch { }
+    }
+    Start-Sleep -Milliseconds 800
+
+    $deadline = [DateTime]::UtcNow.AddHours(12)
+    while ($true) {
+        try {
+            Install-StagedUpdate -StageDirectory $PendingDirectory -Directory $TargetDirectory
+            [void](Write-UpdateCommitBestEffort -Path $UpdateStatePath -CommitSha $PendingVersion)
+            Write-UpdateResult ('UPDATED|' + $PendingVersion)
+            try {
+                Remove-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\RunOnce' -Name 'DEG_Pending_Update' -ErrorAction SilentlyContinue
+            } catch { }
+            Start-Sleep -Milliseconds 200
+            try { [IO.Directory]::Delete([IO.Path]::GetFullPath($PendingDirectory), $true) } catch { }
+            return
+        } catch {
+            if ((Test-DeferredInstallCandidate -ErrorRecord $_) -and [DateTime]::UtcNow -lt $deadline) {
+                Start-Sleep -Seconds 2
+            } else {
+                Write-UpdateFailure -ErrorRecord $_ -Context 'Bekleyen guncelleme kurulamadi'
+                return
+            }
         }
     }
 }
@@ -849,7 +1037,23 @@ function Invoke-DegUpdate {
         }
 
         Set-UpdateProgress -Status 'Yeni surum kuruluyor' -Value 88 -Detail $TargetDirectory
-        Install-StagedUpdate -StageDirectory $stageDirectory -Directory $TargetDirectory
+        try {
+            Install-StagedUpdate -StageDirectory $stageDirectory -Directory $TargetDirectory
+        } catch {
+            $directInstallError = $_
+            if (Test-DeferredInstallCandidate -ErrorRecord $_) {
+                $pendingPath = Queue-PendingUpdate -StageDirectory $stageDirectory -Version $remoteVersion
+                try {
+                    [IO.File]::WriteAllText(
+                        (Join-Path $pendingPath 'direct_install_error.log'),
+                        ($directInstallError | Out-String),
+                        (New-Object Text.UTF8Encoding($false)))
+                } catch { }
+                Write-UpdateResult ('UPDATED|PENDING|' + $remoteVersion)
+                return
+            }
+            throw
+        }
         Set-UpdateProgress -Status 'Kurulum kaydi tamamlaniyor' -Value 96 -Detail ''
         [void](Write-UpdateCommitBestEffort -Path $UpdateStatePath -CommitSha $remoteVersion)
         Write-UpdateResult ('UPDATED|' + $remoteVersion)
@@ -860,6 +1064,11 @@ function Invoke-DegUpdate {
             Remove-Item -LiteralPath $stageDirectory -Recurse -Force -ErrorAction SilentlyContinue
         }
     }
+}
+
+if ($Mode -eq 'ApplyPending') {
+    Invoke-PendingUpdate
+    exit 0
 }
 
 if ($Mode -eq 'Update') {
