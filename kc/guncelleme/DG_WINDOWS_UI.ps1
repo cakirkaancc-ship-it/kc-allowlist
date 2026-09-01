@@ -837,9 +837,52 @@ function Show-MessageWindow {
     [void]$window.ShowDialog()
 }
 
+function Get-LicensePasswordFromText {
+    param([string]$Content)
+    if ([string]::IsNullOrEmpty($Content)) { return $null }
+
+    foreach ($line in ($Content -split "`r?`n")) {
+        $colonIndex = $line.IndexOf(':')
+        if ($colonIndex -lt 0) { continue }
+        $label = $line.Substring(0, $colonIndex).Trim().TrimStart([char]0xFEFF)
+        $normalizedLabel = $label.ToUpperInvariant().Replace([char]0x015E, 'S').Replace([char]0x0130, 'I')
+        if ($normalizedLabel -cne 'SIFRE') { continue }
+        $value = $line.Substring($colonIndex + 1).Trim()
+        if (-not [string]::IsNullOrEmpty($value)) { return $value }
+    }
+    return $null
+}
+
+function Get-RemoteLicensePassword {
+    param([string]$Url)
+    if ([string]::IsNullOrWhiteSpace($Url)) { return $null }
+
+    $separator = if ($Url.Contains('?')) { '&' } else { '?' }
+    $fetchUrl = $Url + $separator + 'kc_nonce=' + [DateTime]::UtcNow.Ticks
+    $response = $null
+    $reader = $null
+    try {
+        [Net.ServicePointManager]::SecurityProtocol =
+            [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+        $request = [Net.HttpWebRequest]::Create($fetchUrl)
+        $request.Method = 'GET'
+        $request.Timeout = 10000
+        $request.ReadWriteTimeout = 10000
+        $request.UserAgent = 'DEG-License-Check'
+        $request.CachePolicy = New-Object Net.Cache.RequestCachePolicy([Net.Cache.RequestCacheLevel]::NoCacheNoStore)
+        $response = $request.GetResponse()
+        $reader = New-Object IO.StreamReader($response.GetResponseStream(), [Text.Encoding]::UTF8, $true)
+        $content = $reader.ReadToEnd()
+        return Get-LicensePasswordFromText -Content $content
+    } finally {
+        if ($null -ne $reader) { $reader.Dispose() }
+        if ($null -ne $response) { $response.Dispose() }
+    }
+}
+
 function Show-LicenseWindow {
-    $lines = if (Test-Path -LiteralPath $StatePath) { [IO.File]::ReadAllLines($StatePath, [Text.Encoding]::Default) } else { @('DEG - Cihaz Yetkilendirme','Bu bilgisayar yetkili degil.') }
-    $title = if ($lines.Count -gt 0 -and -not [string]::IsNullOrWhiteSpace($lines[0])) { $lines[0] } else { 'DEG - Cihaz Yetkilendirme' }
+    $lines = if (Test-Path -LiteralPath $StatePath) { [IO.File]::ReadAllLines($StatePath, [Text.Encoding]::Default) } else { @('DEG', $DeviceCode) }
+    $title = if ($lines.Count -gt 0 -and -not [string]::IsNullOrWhiteSpace($lines[0])) { $lines[0] } else { 'DEG' }
     $message = if ($lines.Count -gt 1) { [string]::Join([Environment]::NewLine, $lines[1..($lines.Count - 1)]) } else { '' }
     $resultPath = $StatePath + '.result'
     if (Test-Path -LiteralPath $resultPath) { Remove-Item -LiteralPath $resultPath -Force -ErrorAction SilentlyContinue }
@@ -847,7 +890,7 @@ function Show-LicenseWindow {
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Width="620" MinWidth="420" MaxWidth="920"
-        Height="420" MinHeight="320" MaxHeight="620"
+        Height="460" MinHeight="350" MaxHeight="650"
         WindowStartupLocation="CenterScreen" Topmost="True"
         Background="#F3F4F6" FontFamily="Segoe UI" FontSize="13">
   <Grid Margin="16">
@@ -855,13 +898,23 @@ function Show-LicenseWindow {
       <RowDefinition Height="*"/>
       <RowDefinition Height="Auto"/>
       <RowDefinition Height="Auto"/>
+      <RowDefinition Height="Auto"/>
     </Grid.RowDefinitions>
     <TextBox x:Name="MessageText" Grid.Row="0" IsReadOnly="True" TextWrapping="Wrap"
              VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto"
              Background="White" BorderBrush="#D1D5DB" Padding="12"/>
-    <TextBlock x:Name="StatusText" Grid.Row="1" MinHeight="22" Margin="0,8,0,0" Foreground="#166534"/>
-    <StackPanel Grid.Row="2" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,8,0,0">
-      <Button x:Name="CopyButton" Content="Cihaz Kodunu Kopyala" Width="185" Height="34" Margin="0,0,8,0" IsDefault="True"/>
+    <Grid Grid.Row="1" Margin="0,14,0,0">
+      <Grid.ColumnDefinitions>
+        <ColumnDefinition Width="Auto"/>
+        <ColumnDefinition Width="*"/>
+      </Grid.ColumnDefinitions>
+      <TextBlock Grid.Column="0" Text="S&#x130;FRE:" FontWeight="SemiBold" VerticalAlignment="Center" Margin="0,0,12,0"/>
+      <PasswordBox x:Name="PasswordBox" Grid.Column="1" Height="34" Padding="8,5" VerticalContentAlignment="Center"/>
+    </Grid>
+    <TextBlock x:Name="StatusText" Grid.Row="2" MinHeight="22" Margin="0,8,0,0" Foreground="#B91C1C"/>
+    <StackPanel Grid.Row="3" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,8,0,0">
+      <Button x:Name="CopyButton" Content="Cihaz Kodunu Kopyala" Width="185" Height="34" Margin="0,0,8,0"/>
+      <Button x:Name="AcceptButton" Content="Giris" Width="100" Height="34" Margin="0,0,8,0" IsDefault="True"/>
       <Button x:Name="CloseButton" Content="Kapat" Width="100" Height="34" IsCancel="True"/>
     </StackPanel>
   </Grid>
@@ -871,8 +924,10 @@ function Show-LicenseWindow {
     $window = [Windows.Markup.XamlReader]::Load($reader)
     $window.Title = $title
     $text = $window.FindName('MessageText')
+    $password = $window.FindName('PasswordBox')
     $status = $window.FindName('StatusText')
     $copy = $window.FindName('CopyButton')
+    $accept = $window.FindName('AcceptButton')
     $close = $window.FindName('CloseButton')
     $text.Text = $message
     if ($SelfTest) {
@@ -892,6 +947,27 @@ function Show-LicenseWindow {
             $status.Text = 'Cihaz kodu olusturulamadi.'
         }
     })
+    $accept.Add_Click({
+        $accept.IsEnabled = $false
+        $status.Text = 'Sifre kontrol ediliyor...'
+        try {
+            $remotePassword = Get-RemoteLicensePassword -Url $PasswordUrl
+            if ([string]::IsNullOrEmpty($remotePassword)) {
+                $status.Text = 'Bypass sifresi bulunamadi.'
+            } elseif ($password.Password.Trim() -ceq $remotePassword) {
+                & $writeResult 'OK'
+                $window.Close()
+            } else {
+                $status.Text = 'Sifre yanlis.'
+                $password.Clear()
+                $password.Focus()
+            }
+        } catch {
+            $status.Text = 'Sifre kontrolune ulasilamadi. Internet baglantisini kontrol edin.'
+        } finally {
+            $accept.IsEnabled = $true
+        }
+    })
     $close.Add_Click({
         & $writeResult 'CLOSED'
         $window.Close()
@@ -901,7 +977,7 @@ function Show-LicenseWindow {
             & $writeResult 'CLOSED'
         }
     })
-    $window.Add_ContentRendered({ $copy.Focus() })
+    $window.Add_ContentRendered({ $password.Focus() })
     [void]$window.ShowDialog()
 }
 
