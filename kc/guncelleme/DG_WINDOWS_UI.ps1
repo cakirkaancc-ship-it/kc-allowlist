@@ -924,6 +924,8 @@ $configLabels = @{
     'DK_COPY_SPACING' = 'Kopya Araligi'
     'DK_NORMAL_GROUP_SPACING' = 'Ayni Kat Loop Araligi'
     'DK_NORMAL_FLOOR_SPACING' = 'Katlar Arasi Mesafe'
+    'DK_NORMAL_AREA_LAYERS' = 'Normal Loop Polyline Layerlari'
+    'DK_COMBINED_RISER_LAYERS' = 'Kombine Polyline Layerlari'
     'DK_TEXT_HEIGHT' = 'Yazi Yuksekligi'
     'DK_TEXT_OFFSET_Y' = 'Yazi Y Ofset'
     'DK_UNDER_X1' = 'Sol Ofset'
@@ -1100,6 +1102,8 @@ function Get-RowSection {
             return 'DN Genel'
         }
         'DK' {
+            if ($key -eq 'DK_NORMAL_AREA_LAYERS') { return 'DK Normal Loop Layerlari' }
+            if ($key -eq 'DK_COMBINED_RISER_LAYERS') { return 'DK Kombine Layerlari' }
             if ($key -match '^DK_NORMAL_(GROUP|FLOOR)_SPACING$' -or $key -match '^DK_LOOP_') { return 'DK Loop Ayarlari' }
             if ($key -match '^DK_UNDER_') { return 'DK Normal Alt Cizgi' }
             if ($key -match '^DKX_DATA_SHIFT_') { return 'DK DATA Block Kaydirma' }
@@ -1154,7 +1158,7 @@ function Get-SectionRank {
         'DG' = @('Aydinlatma / Priz','KNX / Buton / Anahtar / Kit','Data / Fiber','Telefon / TV','UPS','Kartli Gecis','DG Genel')
         'DGT' = @('DGT Renkleri','DGT Islemleri')
         'DN' = @('DN Hat Patternleri','DN CCTV','Dosemeye Inis / Not','Kolon / Yardimci','Buat / Pano','Yangin / Terminal','DN skipThis','DN Fire / Flasher Filter','DN Genel')
-        'DK' = @('DK Normal','DK Normal Alt Cizgi','DK Loop Ayarlari','DK DATA / CCTV Genel','DK DATA / CCTV Cizgi','DK DATA Layerlari','DK DATA Block Kaydirma','DK CCTV Layerlari','DK Cikti Layerlari','DK Yardimci')
+        'DK' = @('DK Normal Loop Layerlari','DK Kombine Layerlari','DK Normal','DK Normal Alt Cizgi','DK Loop Ayarlari','DK DATA / CCTV Genel','DK DATA / CCTV Cizgi','DK DATA Layerlari','DK DATA Block Kaydirma','DK CCTV Layerlari','DK Cikti Layerlari','DK Yardimci')
         'DP' = @('DP Aydinlatma Layerlari','DP Data / Kombine Layerlari','DP CCTV Hatlari','DP CCTV Pattern / Keyword','Plandaki E_ Hat Kat Sayilari','DP Genel')
         'DS' = @('DS Mesafe Ayarlari','DS Liste Bolum Araliklari','Ozel Block Kaydirma','Dahil Edilmeyen Blocklar')
         'DTT' = @('DTT Tava Etiket Geometrisi','Attribute Yazi Ayarlari')
