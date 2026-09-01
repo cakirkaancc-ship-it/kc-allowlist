@@ -6,6 +6,7 @@ param(
     [string]$DeviceCode = '',
     [string]$UpdateApiUrl = '',
     [string]$UpdateContentsApiUrl = '',
+    [string]$UpdateRawBaseUrl = '',
     [string]$TargetDirectory = '',
     [string]$UpdateStatePath = '',
     [ValidateSet('Settings','Message','License','DeviceCode','Update')]
@@ -22,13 +23,82 @@ $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Security
 $LogPath = $StatePath + '.log'
 trap {
+    $trapText = try { [string]$_.Exception.Message } catch { 'Beklenmeyen PowerShell hatasi.' }
+    $trapText = ($trapText -replace '[\r\n|]+', ' ').Trim()
     try { [IO.File]::WriteAllText($LogPath, ($_ | Out-String), (New-Object Text.UTF8Encoding($false))) } catch { }
+    try { Write-UpdateResult ('FAILED|' + $trapText) } catch { }
     exit 1
 }
 
 function Write-UpdateResult {
     param([string]$Value)
     [IO.File]::WriteAllText($StatePath + '.result', $Value, (New-Object Text.UTF8Encoding($false)))
+}
+
+function Get-UpdateErrorSummary {
+    param([object]$ErrorRecord)
+
+    $exception = if ($null -ne $ErrorRecord) { $ErrorRecord.Exception } else { $null }
+    $message = if ($null -ne $exception) { [string]$exception.Message } else { [string]$ErrorRecord }
+    $prefix = ''
+    if ($exception -is [Net.WebException]) {
+        switch ($exception.Status) {
+            ([Net.WebExceptionStatus]::Timeout) { $prefix = 'GitHub baglantisi zaman asimina ugradi. '; break }
+            ([Net.WebExceptionStatus]::NameResolutionFailure) { $prefix = 'GitHub adresi cozumlenemedi. Internet veya DNS baglantisini kontrol edin. '; break }
+            ([Net.WebExceptionStatus]::ProxyNameResolutionFailure) { $prefix = 'Vekil sunucu adresi cozumlenemedi. '; break }
+            ([Net.WebExceptionStatus]::TrustFailure) { $prefix = 'Guvenli GitHub baglantisi kurulamadi. Windows sertifikalarini kontrol edin. '; break }
+            default { }
+        }
+        try {
+            if ($null -ne $exception.Response) {
+                $statusCode = [int]$exception.Response.StatusCode
+                if ($statusCode -eq 403 -or $statusCode -eq 429) {
+                    $prefix = 'GitHub erisim limiti veya ag engeliyle karsilasti. '
+                } elseif ($statusCode -eq 404) {
+                    $prefix = 'GitHub guncelleme dosyasi bulunamadi. '
+                } elseif ($statusCode -eq 407) {
+                    $prefix = 'Vekil sunucu oturum acma bilgisi istiyor. '
+                } elseif ($statusCode -ge 500) {
+                    $prefix = 'GitHub gecici bir sunucu hatasi dondurdu. '
+                }
+            }
+        } catch { }
+    } elseif ($exception -is [UnauthorizedAccessException]) {
+        $prefix = 'Guncelleme klasorune yazma izni yok. '
+    } elseif ($exception -is [IO.IOException]) {
+        $prefix = 'Guncelleme dosyalarindan biri baska bir program tarafindan kullaniliyor. '
+    }
+    $summary = ($prefix + $message) -replace '[\r\n|]+', ' '
+    $summary = $summary.Trim()
+    if ([string]::IsNullOrWhiteSpace($summary)) { $summary = 'Bilinmeyen guncelleme hatasi.' }
+    if ($summary.Length -gt 700) { $summary = $summary.Substring(0, 700) }
+    return $summary
+}
+
+function Write-UpdateFailure {
+    param(
+        [object]$ErrorRecord,
+        [string]$Context = ''
+    )
+
+    $summary = Get-UpdateErrorSummary -ErrorRecord $ErrorRecord
+    if (-not [string]::IsNullOrWhiteSpace($Context)) {
+        $summary = $Context.Trim() + ': ' + $summary
+    }
+    try {
+        $details = @(
+            ('Zaman: ' + [DateTime]::Now.ToString('yyyy-MM-dd HH:mm:ss')),
+            ('Bilgisayar: ' + $env:COMPUTERNAME),
+            ('Windows: ' + [Environment]::OSVersion.VersionString),
+            ('PowerShell: ' + $PSVersionTable.PSVersion.ToString()),
+            ('Hedef: ' + $TargetDirectory),
+            ('Ozet: ' + $summary),
+            '',
+            ($ErrorRecord | Out-String)
+        ) -join "`r`n"
+        [IO.File]::WriteAllText($LogPath, $details, (New-Object Text.UTF8Encoding($false)))
+    } catch { }
+    Write-UpdateResult ('FAILED|' + $summary)
 }
 
 function Test-DeviceCodeFormat {
@@ -209,8 +279,19 @@ function Finish-UpdateProgressWindow {
         Set-UpdateProgress -Status 'Dosyalar zaten guncel' -Value 100 -Detail ''
         Start-Sleep -Milliseconds 700
     } else {
-        Set-UpdateProgress -Status 'Guncelleme tamamlanamadi' -Value 100 -Detail 'Ayrintilar guncelleme gunlugune yazildi.'
-        Start-Sleep -Milliseconds 1600
+        $failureDetail = 'Bilinmeyen guncelleme hatasi.'
+        if ($result -like 'FAILED|*' -and $result.Length -gt 7) {
+            $failureDetail = $result.Substring(7).Trim()
+        }
+        Set-UpdateProgress -Status 'Guncelleme tamamlanamadi' -Value 100 -Detail $failureDetail
+        Start-Sleep -Milliseconds 450
+        Close-UpdateProgressWindow
+        [void][Windows.MessageBox]::Show(
+            "Guncelleme tamamlanamadi.`n`n$failureDetail`n`nGunluk: $LogPath",
+            'DEG Guncelleme',
+            [Windows.MessageBoxButton]::OK,
+            [Windows.MessageBoxImage]::Error)
+        return
     }
     Close-UpdateProgressWindow
 }
@@ -220,7 +301,7 @@ function Quote-ProcessArgument {
     return '"' + $Value.Replace('"', '\"') + '"'
 }
 
-function Save-RemoteUpdateFile {
+function Save-RemoteUpdateFileOnce {
     param(
         [string]$Url,
         [string]$Destination,
@@ -246,6 +327,10 @@ function Save-RemoteUpdateFile {
         $request.Timeout = 15000
         $request.ReadWriteTimeout = 15000
         $request.UserAgent = 'DEG-Auto-Update'
+        $request.AutomaticDecompression = [Net.DecompressionMethods]::GZip -bor [Net.DecompressionMethods]::Deflate
+        if ($null -ne $request.Proxy) {
+            $request.Proxy.Credentials = [Net.CredentialCache]::DefaultNetworkCredentials
+        }
         $request.CachePolicy = New-Object Net.Cache.RequestCachePolicy([Net.Cache.RequestCacheLevel]::NoCacheNoStore)
         $response = $request.GetResponse()
         $inputStream = $response.GetResponseStream()
@@ -268,11 +353,35 @@ function Save-RemoteUpdateFile {
     }
 }
 
-function Get-UpdateFileNames {
-    return @('DG_DO_R05.vlx', 'DG_DT_TAVA_PALET.ps1', 'DG_WINDOWS_UI.ps1')
+function Save-RemoteUpdateFile {
+    param(
+        [string]$Url,
+        [string]$Destination,
+        [string]$DisplayName = ''
+    )
+
+    $downloadedBefore = $script:UpdateDownloadedBytes
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+        try {
+            Save-RemoteUpdateFileOnce -Url $Url -Destination $Destination -DisplayName $DisplayName
+            return
+        } catch {
+            $script:UpdateDownloadedBytes = $downloadedBefore
+            if (Test-Path -LiteralPath $Destination) {
+                Remove-Item -LiteralPath $Destination -Force -ErrorAction SilentlyContinue
+            }
+            if ($attempt -ge 3) { throw }
+            Set-UpdateProgress -Status ('Baglanti yeniden deneniyor: ' + $DisplayName) -Value 28 -Detail ('Deneme ' + ($attempt + 1) + ' / 3')
+            Start-Sleep -Milliseconds (700 * $attempt)
+        }
+    }
 }
 
-function Get-GitHubJson {
+function Get-UpdateFileNames {
+    return @('DG_DO_R05.VLX', 'DG_DT_TAVA_PALET.ps1', 'DG_WINDOWS_UI.ps1')
+}
+
+function Get-GitHubJsonOnce {
     param([string]$Url)
 
     $uri = [Uri]$Url
@@ -288,8 +397,42 @@ function Get-GitHubJson {
     }
     $separator = if ($Url.Contains('?')) { '&' } else { '?' }
     $fetchUrl = $Url + $separator + 'kc_nonce=' + [DateTime]::UtcNow.Ticks
-    $response = Invoke-WebRequest -UseBasicParsing -Uri $fetchUrl -Headers $headers -UserAgent 'DEG-Auto-Update' -TimeoutSec 15
-    return ($response.Content | ConvertFrom-Json)
+    $request = [Net.HttpWebRequest]::Create($fetchUrl)
+    $request.Method = 'GET'
+    $request.Timeout = 15000
+    $request.ReadWriteTimeout = 15000
+    $request.UserAgent = 'DEG-Auto-Update'
+    $request.Accept = $headers.Accept
+    $request.Headers['X-GitHub-Api-Version'] = $headers['X-GitHub-Api-Version']
+    $request.AutomaticDecompression = [Net.DecompressionMethods]::GZip -bor [Net.DecompressionMethods]::Deflate
+    if ($null -ne $request.Proxy) {
+        $request.Proxy.Credentials = [Net.CredentialCache]::DefaultNetworkCredentials
+    }
+    $request.CachePolicy = New-Object Net.Cache.RequestCachePolicy([Net.Cache.RequestCacheLevel]::NoCacheNoStore)
+    $response = $null
+    $reader = $null
+    try {
+        $response = $request.GetResponse()
+        $reader = New-Object IO.StreamReader($response.GetResponseStream(), [Text.Encoding]::UTF8, $true)
+        return ($reader.ReadToEnd() | ConvertFrom-Json)
+    } finally {
+        if ($null -ne $reader) { $reader.Dispose() }
+        if ($null -ne $response) { $response.Dispose() }
+    }
+}
+
+function Get-GitHubJson {
+    param([string]$Url)
+
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+        try {
+            return Get-GitHubJsonOnce -Url $Url
+        } catch {
+            if ($attempt -ge 3) { throw }
+            Set-UpdateProgress -Status 'GitHub baglantisi yeniden deneniyor' -Value 8 -Detail ('Deneme ' + ($attempt + 1) + ' / 3')
+            Start-Sleep -Milliseconds (700 * $attempt)
+        }
+    }
 }
 
 function Get-GitBlobSha {
@@ -348,6 +491,112 @@ function Test-InstalledFilesMatchMetadata {
         if (-not (Test-FileMatchesMetadata -Path $path -Metadata $Metadata[$name])) { return $false }
     }
     return $true
+}
+
+function Get-FileSha256 {
+    param([string]$Path)
+
+    $sha256 = [Security.Cryptography.SHA256]::Create()
+    $stream = $null
+    try {
+        $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+        return (($sha256.ComputeHash($stream) | ForEach-Object { $_.ToString('x2') }) -join '')
+    } finally {
+        if ($null -ne $stream) { $stream.Dispose() }
+        $sha256.Dispose()
+    }
+}
+
+function Resolve-UpdateRawBaseUrl {
+    if (-not [string]::IsNullOrWhiteSpace($UpdateRawBaseUrl)) {
+        return $UpdateRawBaseUrl.TrimEnd('/')
+    }
+
+    $match = [regex]::Match(
+        $UpdateContentsApiUrl,
+        '^https://api\.github\.com/repos/([^/]+)/([^/]+)/contents/(.+?)(?:\?.*)?$',
+        [Text.RegularExpressions.RegexOptions]::IgnoreCase)
+    if (-not $match.Success) {
+        throw 'GitHub ham dosya adresi olusturulamadi.'
+    }
+    $branch = 'main'
+    $branchMatch = [regex]::Match($UpdateApiUrl, '(?:[?&])sha=([^&]+)', [Text.RegularExpressions.RegexOptions]::IgnoreCase)
+    if ($branchMatch.Success) {
+        $branch = [Uri]::UnescapeDataString($branchMatch.Groups[1].Value)
+    }
+    return ('https://raw.githubusercontent.com/{0}/{1}/refs/heads/{2}/{3}' -f
+        $match.Groups[1].Value,
+        $match.Groups[2].Value,
+        $branch,
+        $match.Groups[3].Value.Trim('/'))
+}
+
+function Get-StagedUpdateToken {
+    param([string]$StageDirectory)
+
+    $lines = foreach ($name in (Get-UpdateFileNames)) {
+        $path = Join-Path $StageDirectory $name
+        $item = Get-Item -LiteralPath $path
+        $name.ToLowerInvariant() + '|' + $item.Length + '|' + (Get-FileSha256 -Path $path)
+    }
+    $bytes = [Text.Encoding]::UTF8.GetBytes(($lines -join "`n"))
+    $sha256 = [Security.Cryptography.SHA256]::Create()
+    try {
+        $hash = (($sha256.ComputeHash($bytes) | ForEach-Object { $_.ToString('x2') }) -join '')
+    } finally {
+        $sha256.Dispose()
+    }
+    return ('files-' + $hash)
+}
+
+function Test-StagedFilesMatchInstalled {
+    param(
+        [string]$StageDirectory,
+        [string]$Directory
+    )
+
+    foreach ($name in (Get-UpdateFileNames)) {
+        $staged = Join-Path $StageDirectory $name
+        $installed = Join-Path $Directory $name
+        if (-not (Test-Path -LiteralPath $installed -PathType Leaf)) { return $false }
+        if ((Get-Item -LiteralPath $staged).Length -ne (Get-Item -LiteralPath $installed).Length) { return $false }
+        if ((Get-FileSha256 -Path $staged) -cne (Get-FileSha256 -Path $installed)) { return $false }
+    }
+    return $true
+}
+
+function Test-StagedUpdateFiles {
+    param([string]$StageDirectory)
+
+    foreach ($name in (Get-UpdateFileNames)) {
+        $path = Join-Path $StageDirectory $name
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf) -or (Get-Item -LiteralPath $path).Length -le 0) {
+            throw ($name + ' indirilemedi veya bos geldi.')
+        }
+        $firstLine = [IO.File]::ReadLines($path) | Select-Object -First 1
+        if ([string]$firstLine -like 'version https://git-lfs.github.com/spec/*') {
+            throw ($name + ' yerine Git LFS isaret dosyasi indirildi.')
+        }
+    }
+    Test-PowerShellSyntax -Path (Join-Path $StageDirectory 'DG_DT_TAVA_PALET.ps1')
+    Test-PowerShellSyntax -Path (Join-Path $StageDirectory 'DG_WINDOWS_UI.ps1')
+}
+
+function Write-UpdateCommitBestEffort {
+    param(
+        [string]$Path,
+        [string]$CommitSha
+    )
+
+    try {
+        Write-UpdateCommit -Path $Path -CommitSha $CommitSha
+        return $true
+    } catch {
+        try {
+            Add-Content -LiteralPath $LogPath -Value ("`r`nUyari: Surum kaydi yazilamadi: " + $_.Exception.Message) -Encoding UTF8
+        } catch { }
+        return $false
+    }
 }
 
 function Test-PowerShellSyntax {
@@ -477,6 +726,7 @@ function Invoke-ElevatedUpdate {
         ' -Mode Update -StatePath ' + (Quote-ProcessArgument $StatePath) +
         ' -UpdateApiUrl ' + (Quote-ProcessArgument $UpdateApiUrl) +
         ' -UpdateContentsApiUrl ' + (Quote-ProcessArgument $UpdateContentsApiUrl) +
+        ' -UpdateRawBaseUrl ' + (Quote-ProcessArgument $UpdateRawBaseUrl) +
         ' -TargetDirectory ' + (Quote-ProcessArgument $TargetDirectory) +
         ' -UpdateStatePath ' + (Quote-ProcessArgument $UpdateStatePath) +
         ' -UpdateUserSid ' + (Quote-ProcessArgument $requestingUserSid) +
@@ -510,69 +760,101 @@ function Invoke-DegUpdate {
 
     $stageDirectory = Join-Path $env:TEMP ('DEG_update_' + [guid]::NewGuid().ToString('N'))
     try {
-        Set-UpdateProgress -Status 'Guncelleme bilgisi kontrol ediliyor' -Value 5 -Detail 'GitHub baglantisi kuruluyor...'
-        $commits = @(Get-GitHubJson -Url $UpdateApiUrl)
-        if ($commits.Count -lt 1 -or [string]$commits[0].sha -notmatch '^[0-9A-Fa-f]{40,64}$') {
-            throw 'GitHub guncelleme commit bilgisi gecersiz.'
-        }
-        $remoteCommit = ([string]$commits[0].sha).ToLowerInvariant()
-
-        $localCommit = ''
+        $localVersion = ''
         if (Test-Path -LiteralPath $UpdateStatePath -PathType Leaf) {
-            $localCommit = [IO.File]::ReadAllText($UpdateStatePath).Trim().ToLowerInvariant()
-        }
-        if ($localCommit -ceq $remoteCommit) {
-            Write-UpdateResult ('CURRENT|' + $remoteCommit)
-            return
+            try { $localVersion = [IO.File]::ReadAllText($UpdateStatePath).Trim().ToLowerInvariant() } catch { $localVersion = '' }
         }
 
-        Set-UpdateProgress -Status 'Dosya listesi aliniyor' -Value 15 -Detail 'Yeni surum bulundu.'
-        $contentsSeparator = if ($UpdateContentsApiUrl.Contains('?')) { '&' } else { '?' }
-        $contentsUrl = $UpdateContentsApiUrl + $contentsSeparator + 'ref=' + [Uri]::EscapeDataString($remoteCommit)
-        $metadata = Get-UpdateFileMetadata -Contents @(Get-GitHubJson -Url $contentsUrl)
-
-        if ([string]::IsNullOrWhiteSpace($localCommit) -and
-            (Test-InstalledFilesMatchMetadata -Directory $TargetDirectory -Metadata $metadata)) {
-            Write-UpdateCommit -Path $UpdateStatePath -CommitSha $remoteCommit
-            Write-UpdateResult ('CURRENT|' + $remoteCommit)
-            return
-        }
-
-        if ($ElevatedUpdate) {
-            try { Grant-UpdateTargetWriteAccess -Directory $TargetDirectory -UserSid $UpdateUserSid } catch { }
-        }
-        Set-UpdateProgress -Status 'Kurulum klasoru denetleniyor' -Value 24 -Detail $TargetDirectory
-        if (-not (Test-UpdateTargetWritable -Directory $TargetDirectory)) {
-            if (-not $ElevatedUpdate) {
-                try { Invoke-ElevatedUpdate } catch { Write-UpdateResult 'FAILED|Yonetici izni reddedildi.' }
-            } else {
-                Write-UpdateResult 'FAILED|Hedef klasore yazilamadi.'
+        $metadata = $null
+        $remoteVersion = ''
+        $apiError = $null
+        Set-UpdateProgress -Status 'Guncelleme bilgisi kontrol ediliyor' -Value 5 -Detail 'GitHub baglantisi kuruluyor...'
+        try {
+            $commits = @(Get-GitHubJson -Url $UpdateApiUrl)
+            if ($commits.Count -lt 1 -or [string]$commits[0].sha -notmatch '^[0-9A-Fa-f]{40,64}$') {
+                throw 'GitHub guncelleme commit bilgisi gecersiz.'
             }
-            return
+            $remoteVersion = ([string]$commits[0].sha).ToLowerInvariant()
+            if ($localVersion -ceq $remoteVersion) {
+                Write-UpdateResult ('CURRENT|' + $remoteVersion)
+                return
+            }
+
+            Set-UpdateProgress -Status 'Dosya listesi aliniyor' -Value 15 -Detail 'Yeni surum bulundu.'
+            $contentsSeparator = if ($UpdateContentsApiUrl.Contains('?')) { '&' } else { '?' }
+            $contentsUrl = $UpdateContentsApiUrl + $contentsSeparator + 'ref=' + [Uri]::EscapeDataString($remoteVersion)
+            $metadata = Get-UpdateFileMetadata -Contents @(Get-GitHubJson -Url $contentsUrl)
+            if (Test-InstalledFilesMatchMetadata -Directory $TargetDirectory -Metadata $metadata) {
+                [void](Write-UpdateCommitBestEffort -Path $UpdateStatePath -CommitSha $remoteVersion)
+                Write-UpdateResult ('CURRENT|' + $remoteVersion)
+                return
+            }
+        } catch {
+            $apiError = $_
+            $metadata = $null
         }
 
         [void](New-Item -ItemType Directory -Path $stageDirectory -Force)
         $script:UpdateDownloadedBytes = [long]0
-        $script:UpdateTotalBytes = [long](($metadata.Values | Measure-Object -Property size -Sum).Sum)
-        foreach ($name in (Get-UpdateFileNames)) {
-            $destination = Join-Path $stageDirectory $name
-            Save-RemoteUpdateFile -Url ([string]$metadata[$name].download_url) -Destination $destination -DisplayName $name
-            if (-not (Test-FileMatchesMetadata -Path $destination -Metadata $metadata[$name])) {
-                throw ($name + ' Git blob SHA dogrulamasi basarisiz.')
+        if ($null -ne $metadata) {
+            $script:UpdateTotalBytes = [long](($metadata.Values | Measure-Object -Property size -Sum).Sum)
+            foreach ($name in (Get-UpdateFileNames)) {
+                $destination = Join-Path $stageDirectory $name
+                Save-RemoteUpdateFile -Url ([string]$metadata[$name].download_url) -Destination $destination -DisplayName $name
+                if (-not (Test-FileMatchesMetadata -Path $destination -Metadata $metadata[$name])) {
+                    throw ($name + ' Git blob SHA dogrulamasi basarisiz.')
+                }
+            }
+        } else {
+            $apiSummary = Get-UpdateErrorSummary -ErrorRecord $apiError
+            Set-UpdateProgress -Status 'Alternatif indirme baglantisi kullaniliyor' -Value 20 -Detail $apiSummary
+            try {
+                $rawBase = Resolve-UpdateRawBaseUrl
+                $script:UpdateTotalBytes = [long]0
+                $rawIndex = 0
+                foreach ($name in (Get-UpdateFileNames)) {
+                    $rawIndex++
+                    Set-UpdateProgress -Status ('Indiriliyor: ' + $name) -Value (20 + ($rawIndex * 15)) -Detail 'GitHub ham dosya baglantisi'
+                    $destination = Join-Path $stageDirectory $name
+                    Save-RemoteUpdateFile -Url ($rawBase.TrimEnd('/') + '/' + [Uri]::EscapeDataString($name)) -Destination $destination -DisplayName $name
+                }
+                Test-StagedUpdateFiles -StageDirectory $stageDirectory
+                $remoteVersion = Get-StagedUpdateToken -StageDirectory $stageDirectory
+                if ($localVersion -ceq $remoteVersion -or
+                    (Test-StagedFilesMatchInstalled -StageDirectory $stageDirectory -Directory $TargetDirectory)) {
+                    [void](Write-UpdateCommitBestEffort -Path $UpdateStatePath -CommitSha $remoteVersion)
+                    Write-UpdateResult ('CURRENT|' + $remoteVersion)
+                    return
+                }
+            } catch {
+                $rawSummary = Get-UpdateErrorSummary -ErrorRecord $_
+                throw ('GitHub API: ' + $apiSummary + ' Ham dosya baglantisi: ' + $rawSummary)
             }
         }
-        Set-UpdateProgress -Status 'Dosyalar dogrulaniyor' -Value 78 -Detail 'SHA ve PowerShell kontrolleri yapiliyor.'
-        Test-PowerShellSyntax -Path (Join-Path $stageDirectory 'DG_DT_TAVA_PALET.ps1')
-        Test-PowerShellSyntax -Path (Join-Path $stageDirectory 'DG_WINDOWS_UI.ps1')
+
+        Set-UpdateProgress -Status 'Dosyalar dogrulaniyor' -Value 78 -Detail 'Dosya ve PowerShell kontrolleri yapiliyor.'
+        Test-StagedUpdateFiles -StageDirectory $stageDirectory
+
+        if ($ElevatedUpdate) {
+            try { Grant-UpdateTargetWriteAccess -Directory $TargetDirectory -UserSid $UpdateUserSid } catch { }
+        }
+        Set-UpdateProgress -Status 'Kurulum klasoru denetleniyor' -Value 82 -Detail $TargetDirectory
+        if (-not (Test-UpdateTargetWritable -Directory $TargetDirectory)) {
+            if (-not $ElevatedUpdate) {
+                try { Invoke-ElevatedUpdate } catch { Write-UpdateFailure -ErrorRecord $_ -Context 'Yonetici izni alinamadi' }
+            } else {
+                Write-UpdateResult 'FAILED|Hedef klasore yazilamadi. Klasor izinlerini kontrol edin.'
+            }
+            return
+        }
 
         Set-UpdateProgress -Status 'Yeni surum kuruluyor' -Value 88 -Detail $TargetDirectory
         Install-StagedUpdate -StageDirectory $stageDirectory -Directory $TargetDirectory
-        Set-UpdateProgress -Status 'Kurulum kaydi tamamlanıyor' -Value 96 -Detail ''
-        Write-UpdateCommit -Path $UpdateStatePath -CommitSha $remoteCommit
-        Write-UpdateResult ('UPDATED|' + $remoteCommit)
+        Set-UpdateProgress -Status 'Kurulum kaydi tamamlaniyor' -Value 96 -Detail ''
+        [void](Write-UpdateCommitBestEffort -Path $UpdateStatePath -CommitSha $remoteVersion)
+        Write-UpdateResult ('UPDATED|' + $remoteVersion)
     } catch {
-        try { [IO.File]::WriteAllText($LogPath, ($_ | Out-String), (New-Object Text.UTF8Encoding($false))) } catch { }
-        Write-UpdateResult 'FAILED|Guncelleme tamamlanamadi.'
+        Write-UpdateFailure -ErrorRecord $_
     } finally {
         if (Test-Path -LiteralPath $stageDirectory) {
             Remove-Item -LiteralPath $stageDirectory -Recurse -Force -ErrorAction SilentlyContinue
