@@ -2,11 +2,13 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$StatePath,
     [string]$PasswordUrl = '',
+    [string]$DeviceCodePath = '',
+    [string]$DeviceCode = '',
     [string]$UpdateApiUrl = '',
     [string]$UpdateContentsApiUrl = '',
     [string]$TargetDirectory = '',
     [string]$UpdateStatePath = '',
-    [ValidateSet('Settings','Message','License','Update')]
+    [ValidateSet('Settings','Message','License','DeviceCode','Update')]
     [string]$Mode = 'Settings',
     [int]$HostPid = 0,
     [long]$HostHwnd = 0,
@@ -17,6 +19,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.Security
 $LogPath = $StatePath + '.log'
 trap {
     try { [IO.File]::WriteAllText($LogPath, ($_ | Out-String), (New-Object Text.UTF8Encoding($false))) } catch { }
@@ -26,6 +29,109 @@ trap {
 function Write-UpdateResult {
     param([string]$Value)
     [IO.File]::WriteAllText($StatePath + '.result', $Value, (New-Object Text.UTF8Encoding($false)))
+}
+
+function Test-DeviceCodeFormat {
+    param([string]$Code)
+    return (-not [string]::IsNullOrWhiteSpace($Code)) -and
+        ($Code.Trim().ToUpperInvariant() -cmatch '^KCPC-[0-9A-F]{8}-[0-9A-F]{8}-[0-9A-F]{8}-[0-9A-F]{8}$')
+}
+
+function New-DeviceSecret {
+    $bytes = New-Object byte[] 32
+    $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
+    try {
+        $rng.GetBytes($bytes)
+    } finally {
+        $rng.Dispose()
+    }
+    return ,$bytes
+}
+
+function Get-MachineIdentity {
+    $machineGuid = [Microsoft.Win32.Registry]::GetValue(
+        'HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Cryptography',
+        'MachineGuid',
+        $null)
+    if ([string]::IsNullOrWhiteSpace([string]$machineGuid)) {
+        throw 'Windows makine kimligi okunamadi.'
+    }
+    return ([string]$machineGuid).Trim().ToUpperInvariant()
+}
+
+function Get-DeviceCodeFromSecret {
+    param([byte[]]$Secret)
+    if ($null -eq $Secret -or $Secret.Length -ne 32) {
+        throw 'Cihaz gizli anahtari gecersiz.'
+    }
+    $machineBytes = [Text.Encoding]::UTF8.GetBytes('DEG-KC-DEVICE-V1|' + (Get-MachineIdentity) + '|')
+    $inputBytes = New-Object byte[] ($machineBytes.Length + $Secret.Length)
+    [Array]::Copy($machineBytes, 0, $inputBytes, 0, $machineBytes.Length)
+    [Array]::Copy($Secret, 0, $inputBytes, $machineBytes.Length, $Secret.Length)
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try {
+        $digest = $sha.ComputeHash($inputBytes)
+    } finally {
+        $sha.Dispose()
+    }
+    $hex = ([BitConverter]::ToString($digest, 0, 16)).Replace('-', '')
+    return ('KCPC-{0}-{1}-{2}-{3}' -f
+        $hex.Substring(0, 8),
+        $hex.Substring(8, 8),
+        $hex.Substring(16, 8),
+        $hex.Substring(24, 8))
+}
+
+function Read-ProtectedDeviceSecret {
+    param([string]$Path)
+    $entropy = [Text.Encoding]::UTF8.GetBytes('DEG-KC-DEVICE-V1')
+    $encoded = [IO.File]::ReadAllText($Path, [Text.Encoding]::ASCII).Trim()
+    $protectedBytes = [Convert]::FromBase64String($encoded)
+    $secret = [Security.Cryptography.ProtectedData]::Unprotect(
+        $protectedBytes,
+        $entropy,
+        [Security.Cryptography.DataProtectionScope]::LocalMachine)
+    if ($null -eq $secret -or $secret.Length -ne 32) {
+        throw 'Kayitli cihaz gizli anahtari gecersiz.'
+    }
+    return ,$secret
+}
+
+function Get-OrCreateDeviceCode {
+    param([string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        throw 'Cihaz kodu dosya yolu verilmedi.'
+    }
+
+    $fullPath = [IO.Path]::GetFullPath($Path)
+    $directory = [IO.Path]::GetDirectoryName($fullPath)
+    if ([string]::IsNullOrWhiteSpace($directory)) {
+        throw 'Cihaz kodu klasoru bulunamadi.'
+    }
+    [void][IO.Directory]::CreateDirectory($directory)
+
+    if ([IO.File]::Exists($fullPath)) {
+        $secret = Read-ProtectedDeviceSecret -Path $fullPath
+        return Get-DeviceCodeFromSecret -Secret $secret
+    }
+
+    $secret = New-DeviceSecret
+    $entropy = [Text.Encoding]::UTF8.GetBytes('DEG-KC-DEVICE-V1')
+    $protectedBytes = [Security.Cryptography.ProtectedData]::Protect(
+        $secret,
+        $entropy,
+        [Security.Cryptography.DataProtectionScope]::LocalMachine)
+    $encoded = [Convert]::ToBase64String($protectedBytes)
+    $tempPath = $fullPath + '.new_' + [Diagnostics.Process]::GetCurrentProcess().Id
+    [IO.File]::WriteAllText($tempPath, $encoded, [Text.Encoding]::ASCII)
+
+    if ([IO.File]::Exists($fullPath)) {
+        [IO.File]::Delete($tempPath)
+        $secret = Read-ProtectedDeviceSecret -Path $fullPath
+        return Get-DeviceCodeFromSecret -Secret $secret
+    }
+    [IO.File]::Move($tempPath, $fullPath)
+    return Get-DeviceCodeFromSecret -Secret $secret
 }
 
 $script:UpdateWindow = $null
@@ -731,57 +837,9 @@ function Show-MessageWindow {
     [void]$window.ShowDialog()
 }
 
-function Get-LicensePasswordFromText {
-    param([string]$Content)
-
-    if ([string]::IsNullOrEmpty($Content)) { return $null }
-
-    foreach ($line in ($Content -split "`r?`n")) {
-        $colonIndex = $line.IndexOf(':')
-        if ($colonIndex -lt 0) { continue }
-
-        $label = $line.Substring(0, $colonIndex).Trim().TrimStart([char]0xFEFF)
-        $normalizedLabel = $label.ToUpperInvariant().Replace([char]0x015E, 'S').Replace([char]0x0130, 'I')
-        if ($normalizedLabel -cne 'SIFRE') { continue }
-
-        $value = $line.Substring($colonIndex + 1).Trim()
-        if (-not [string]::IsNullOrEmpty($value)) { return $value }
-    }
-
-    return $null
-}
-
-function Get-RemoteLicensePassword {
-    param([string]$Url)
-
-    if ([string]::IsNullOrWhiteSpace($Url)) { return $null }
-
-    $separator = if ($Url.Contains('?')) { '&' } else { '?' }
-    $fetchUrl = $Url + $separator + 'kc_nonce=' + [DateTime]::UtcNow.Ticks
-    $response = $null
-    $reader = $null
-    try {
-        [Net.ServicePointManager]::SecurityProtocol =
-            [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
-        $request = [Net.HttpWebRequest]::Create($fetchUrl)
-        $request.Method = 'GET'
-        $request.Timeout = 10000
-        $request.ReadWriteTimeout = 10000
-        $request.UserAgent = 'DEG-License-Check'
-        $request.CachePolicy = New-Object Net.Cache.RequestCachePolicy([Net.Cache.RequestCacheLevel]::NoCacheNoStore)
-        $response = $request.GetResponse()
-        $reader = New-Object IO.StreamReader($response.GetResponseStream(), [Text.Encoding]::UTF8, $true)
-        $content = $reader.ReadToEnd()
-        return Get-LicensePasswordFromText -Content $content
-    } finally {
-        if ($null -ne $reader) { $reader.Dispose() }
-        if ($null -ne $response) { $response.Dispose() }
-    }
-}
-
 function Show-LicenseWindow {
-    $lines = if (Test-Path -LiteralPath $StatePath) { [IO.File]::ReadAllLines($StatePath, [Text.Encoding]::Default) } else { @('DEG - Izin Yok','Bu bilgisayar yetkili degil.') }
-    $title = if ($lines.Count -gt 0 -and -not [string]::IsNullOrWhiteSpace($lines[0])) { $lines[0] } else { 'DEG - Izin Yok' }
+    $lines = if (Test-Path -LiteralPath $StatePath) { [IO.File]::ReadAllLines($StatePath, [Text.Encoding]::Default) } else { @('DEG - Cihaz Yetkilendirme','Bu bilgisayar yetkili degil.') }
+    $title = if ($lines.Count -gt 0 -and -not [string]::IsNullOrWhiteSpace($lines[0])) { $lines[0] } else { 'DEG - Cihaz Yetkilendirme' }
     $message = if ($lines.Count -gt 1) { [string]::Join([Environment]::NewLine, $lines[1..($lines.Count - 1)]) } else { '' }
     $resultPath = $StatePath + '.result'
     if (Test-Path -LiteralPath $resultPath) { Remove-Item -LiteralPath $resultPath -Force -ErrorAction SilentlyContinue }
@@ -789,7 +847,7 @@ function Show-LicenseWindow {
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Width="620" MinWidth="420" MaxWidth="920"
-        Height="520" MinHeight="360" MaxHeight="760"
+        Height="420" MinHeight="320" MaxHeight="620"
         WindowStartupLocation="CenterScreen" Topmost="True"
         Background="#F3F4F6" FontFamily="Segoe UI" FontSize="13">
   <Grid Margin="16">
@@ -797,24 +855,14 @@ function Show-LicenseWindow {
       <RowDefinition Height="*"/>
       <RowDefinition Height="Auto"/>
       <RowDefinition Height="Auto"/>
-      <RowDefinition Height="Auto"/>
     </Grid.RowDefinitions>
     <TextBox x:Name="MessageText" Grid.Row="0" IsReadOnly="True" TextWrapping="Wrap"
              VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto"
              Background="White" BorderBrush="#D1D5DB" Padding="12"/>
-    <Grid Grid.Row="1" Margin="0,14,0,0">
-      <Grid.ColumnDefinitions>
-        <ColumnDefinition Width="Auto"/>
-        <ColumnDefinition Width="*"/>
-      </Grid.ColumnDefinitions>
-      <TextBlock Grid.Column="0" Text="&#x15E;&#x130;FRE:" FontWeight="SemiBold" VerticalAlignment="Center" Margin="0,0,12,0"/>
-      <PasswordBox x:Name="PasswordBox" Grid.Column="1" Height="34" Padding="8,5" VerticalContentAlignment="Center"/>
-    </Grid>
-    <TextBlock x:Name="StatusText" Grid.Row="2" MinHeight="22" Margin="0,7,0,0" Foreground="#B91C1C"/>
-    <StackPanel Grid.Row="3" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,8,0,0">
-      <Button x:Name="CopyButton" Content="MAC Adreslerini Kopyala" Width="165" Height="34" Margin="0,0,8,0"/>
-      <Button x:Name="AcceptButton" Content="Giris" Width="100" Height="34" Margin="0,0,8,0" IsDefault="True"/>
-      <Button x:Name="CancelButton" Content="Kapat" Width="100" Height="34" IsCancel="True"/>
+    <TextBlock x:Name="StatusText" Grid.Row="1" MinHeight="22" Margin="0,8,0,0" Foreground="#166534"/>
+    <StackPanel Grid.Row="2" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,8,0,0">
+      <Button x:Name="CopyButton" Content="Cihaz Kodunu Kopyala" Width="185" Height="34" Margin="0,0,8,0" IsDefault="True"/>
+      <Button x:Name="CloseButton" Content="Kapat" Width="100" Height="34" IsCancel="True"/>
     </StackPanel>
   </Grid>
 </Window>
@@ -823,11 +871,9 @@ function Show-LicenseWindow {
     $window = [Windows.Markup.XamlReader]::Load($reader)
     $window.Title = $title
     $text = $window.FindName('MessageText')
-    $password = $window.FindName('PasswordBox')
     $status = $window.FindName('StatusText')
     $copy = $window.FindName('CopyButton')
-    $accept = $window.FindName('AcceptButton')
-    $cancel = $window.FindName('CancelButton')
+    $close = $window.FindName('CloseButton')
     $text.Text = $message
     if ($SelfTest) {
         Write-Output ('SELFTEST=OK;MODE=LICENSE;TITLE=' + $title)
@@ -837,39 +883,32 @@ function Show-LicenseWindow {
         param([string]$Value)
         [IO.File]::WriteAllText($resultPath, $Value, (New-Object Text.UTF8Encoding($false)))
     }
-    $copy.Add_Click({ [Windows.Clipboard]::SetText($text.Text) })
-    $accept.Add_Click({
-        $accept.IsEnabled = $false
-        $status.Text = 'Sifre GitHub uzerinden kontrol ediliyor...'
-        try {
-            $remotePassword = Get-RemoteLicensePassword -Url $PasswordUrl
-            if ([string]::IsNullOrEmpty($remotePassword)) {
-                $status.Text = 'GitHub dosyasinda SIFRE :deger satiri bulunamadi.'
-            } elseif ($password.Password.Trim() -ceq $remotePassword) {
-                & $writeResult 'OK'
-                $window.Close()
-            } else {
-                $status.Text = 'Sifre yanlis.'
-                $password.Clear()
-                $password.Focus()
-            }
-        } catch {
-            $status.Text = 'GitHub sayfasina ulasilamadi. Internet baglantisini kontrol edin.'
-        } finally {
-            $accept.IsEnabled = $true
+    $copy.Add_Click({
+        if (Test-DeviceCodeFormat -Code $DeviceCode) {
+            [Windows.Clipboard]::SetText($DeviceCode.Trim().ToUpperInvariant())
+            $status.Text = 'Cihaz kodu panoya kopyalandi.'
+        } else {
+            $status.Foreground = '#B91C1C'
+            $status.Text = 'Cihaz kodu olusturulamadi.'
         }
     })
-    $cancel.Add_Click({
-        & $writeResult 'CANCEL'
+    $close.Add_Click({
+        & $writeResult 'CLOSED'
         $window.Close()
     })
     $window.Add_Closed({
         if (-not (Test-Path -LiteralPath $resultPath)) {
-            & $writeResult 'CANCEL'
+            & $writeResult 'CLOSED'
         }
     })
-    $window.Add_ContentRendered({ $password.Focus() })
+    $window.Add_ContentRendered({ $copy.Focus() })
     [void]$window.ShowDialog()
+}
+
+if ($Mode -eq 'DeviceCode') {
+    $code = Get-OrCreateDeviceCode -Path $DeviceCodePath
+    Write-UpdateResult ('OK|' + $code)
+    exit 0
 }
 
 if ($Mode -eq 'License') {
