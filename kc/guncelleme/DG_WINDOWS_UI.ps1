@@ -4,6 +4,11 @@ param(
     [string]$PasswordUrl = '',
     [string]$DeviceCodePath = '',
     [string]$DeviceCode = '',
+    [string]$LicenseMarkerBaseUrl = '',
+    [string]$LicenseGrantPath = '',
+    [string]$LicenseOverridePath = '',
+    [ValidateRange(1, 168)]
+    [int]$LicenseGrantHours = 24,
     [string]$UpdateApiUrl = '',
     [string]$UpdateContentsApiUrl = '',
     [string]$UpdateRawBaseUrl = '',
@@ -12,7 +17,7 @@ param(
     [string]$PendingDirectory = '',
     [string]$PendingVersion = '',
     [int]$WaitForPid = 0,
-    [ValidateSet('Settings','Message','License','DeviceCode','Update','ApplyPending')]
+    [ValidateSet('Settings','Message','License','LicenseCheck','DeviceCode','Update','ApplyPending')]
     [string]$Mode = 'Settings',
     [int]$HostPid = 0,
     [long]$HostHwnd = 0,
@@ -21,6 +26,61 @@ param(
     [string]$UpdateUserSid = '',
     [switch]$SelfTest
 )
+
+function ConvertTo-DEGCompatiblePath {
+    param([AllowEmptyString()][string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $Path }
+    $candidate = [Environment]::ExpandEnvironmentVariables($Path.Trim().Trim('"'))
+    try { $candidate = [IO.Path]::GetFullPath($candidate) } catch { return $candidate }
+
+    # Bazi ANSI tabanli CAD surumleri ASLI~1 kismini ASLI\~1 olarak donduruyor.
+    # Yalnizca bozuk yol yoksa ve birlestirilmis yol/ust klasor varsa onar.
+    if (-not (Test-Path -LiteralPath $candidate)) {
+        $repaired = [Text.RegularExpressions.Regex]::Replace($candidate, '\\~(?=\d+(?:\\|$))', '~')
+        if ($repaired -cne $candidate) {
+            $repairedParent = [IO.Path]::GetDirectoryName($repaired)
+            if ((Test-Path -LiteralPath $repaired) -or
+                (-not [string]::IsNullOrWhiteSpace($repairedParent) -and
+                 (Test-Path -LiteralPath $repairedParent -PathType Container))) {
+                $candidate = $repaired
+            }
+        }
+    }
+
+    # Gecerli 8.3 yolunu (or. ASLI~1) gercek Unicode uzun yola cevir.
+    try {
+        if (Test-Path -LiteralPath $candidate) {
+            return (Get-Item -LiteralPath $candidate -Force).FullName
+        }
+        $parent = [IO.Path]::GetDirectoryName($candidate)
+        if (-not [string]::IsNullOrWhiteSpace($parent) -and
+            (Test-Path -LiteralPath $parent -PathType Container)) {
+            $longParent = (Get-Item -LiteralPath $parent -Force).FullName
+            return Join-Path $longParent ([IO.Path]::GetFileName($candidate))
+        }
+    } catch { }
+    return $candidate
+}
+
+$StatePath       = ConvertTo-DEGCompatiblePath $StatePath
+$DeviceCodePath  = ConvertTo-DEGCompatiblePath $DeviceCodePath
+$LicenseGrantPath = ConvertTo-DEGCompatiblePath $LicenseGrantPath
+$LicenseOverridePath = ConvertTo-DEGCompatiblePath $LicenseOverridePath
+$TargetDirectory = ConvertTo-DEGCompatiblePath $TargetDirectory
+$UpdateStatePath = ConvertTo-DEGCompatiblePath $UpdateStatePath
+$PendingDirectory = ConvertTo-DEGCompatiblePath $PendingDirectory
+
+if ($Mode -eq 'Update' -and
+    (-not [string]::IsNullOrWhiteSpace($TargetDirectory)) -and
+    (-not (Test-Path -LiteralPath $TargetDirectory -PathType Container))) {
+    $scriptDirectory = ConvertTo-DEGCompatiblePath (Split-Path -Parent $PSCommandPath)
+    $requiredFiles = @('DG_DO_R05.VLX', 'DG_DT_TAVA_PALET.ps1', 'DG_WINDOWS_UI.ps1')
+    $scriptDirectoryIsTarget = -not ($requiredFiles | Where-Object {
+        -not (Test-Path -LiteralPath (Join-Path $scriptDirectory $_) -PathType Leaf)
+    })
+    if ($scriptDirectoryIsTarget) { $TargetDirectory = $scriptDirectory }
+}
 
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Security
@@ -205,6 +265,220 @@ function Get-OrCreateDeviceCode {
     }
     [IO.File]::Move($tempPath, $fullPath)
     return Get-DeviceCodeFromSecret -Secret $secret
+}
+
+function Remove-LicenseFile {
+    param([string]$Path)
+    if (-not [string]::IsNullOrWhiteSpace($Path) -and [IO.File]::Exists($Path)) {
+        try { [IO.File]::Delete($Path) } catch { }
+    }
+}
+
+function Write-ProtectedLicenseData {
+    param(
+        [Parameter(Mandatory = $true)][object]$Data,
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Purpose
+    )
+
+    $fullPath = [IO.Path]::GetFullPath($Path)
+    $directory = [IO.Path]::GetDirectoryName($fullPath)
+    if ([string]::IsNullOrWhiteSpace($directory)) { throw 'Lisans kayit klasoru bulunamadi.' }
+    [void][IO.Directory]::CreateDirectory($directory)
+
+    $plainBytes = [Text.Encoding]::UTF8.GetBytes(($Data | ConvertTo-Json -Compress))
+    $entropy = [Text.Encoding]::UTF8.GetBytes($Purpose)
+    $protectedBytes = [Security.Cryptography.ProtectedData]::Protect(
+        $plainBytes,
+        $entropy,
+        [Security.Cryptography.DataProtectionScope]::CurrentUser)
+    $encoded = [Convert]::ToBase64String($protectedBytes)
+    $suffix = [Diagnostics.Process]::GetCurrentProcess().Id.ToString() + '_' + [Guid]::NewGuid().ToString('N')
+    $tempPath = $fullPath + '.new_' + $suffix
+    $backupPath = $fullPath + '.bak_' + $suffix
+
+    try {
+        [IO.File]::WriteAllText($tempPath, $encoded, [Text.Encoding]::ASCII)
+        if ([IO.File]::Exists($fullPath)) {
+            [IO.File]::Replace($tempPath, $fullPath, $backupPath, $true)
+            Remove-LicenseFile -Path $backupPath
+        } else {
+            [IO.File]::Move($tempPath, $fullPath)
+        }
+    } finally {
+        Remove-LicenseFile -Path $tempPath
+        Remove-LicenseFile -Path $backupPath
+        if ($null -ne $plainBytes) { [Array]::Clear($plainBytes, 0, $plainBytes.Length) }
+    }
+}
+
+function Read-ProtectedLicenseData {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Purpose
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Path) -or -not [IO.File]::Exists($Path)) { return $null }
+    $plainBytes = $null
+    try {
+        $encoded = [IO.File]::ReadAllText($Path, [Text.Encoding]::ASCII).Trim()
+        $protectedBytes = [Convert]::FromBase64String($encoded)
+        $entropy = [Text.Encoding]::UTF8.GetBytes($Purpose)
+        $plainBytes = [Security.Cryptography.ProtectedData]::Unprotect(
+            $protectedBytes,
+            $entropy,
+            [Security.Cryptography.DataProtectionScope]::CurrentUser)
+        $json = [Text.Encoding]::UTF8.GetString($plainBytes)
+        return ($json | ConvertFrom-Json)
+    } catch {
+        return $null
+    } finally {
+        if ($null -ne $plainBytes) { [Array]::Clear($plainBytes, 0, $plainBytes.Length) }
+    }
+}
+
+function Write-ProtectedLicenseGrant {
+    param([string]$Path, [string]$Code, [int]$Hours)
+    $now = [DateTimeOffset]::UtcNow
+    $data = [pscustomobject]@{
+        version    = 'KC-GRANT-V1'
+        deviceCode = $Code.Trim().ToUpperInvariant()
+        issuedUtc  = $now.ToString('o')
+        expiresUtc = $now.AddHours($Hours).ToString('o')
+    }
+    Write-ProtectedLicenseData -Data $data -Path $Path -Purpose 'DEG-KC-LICENSE-GRANT-V1'
+}
+
+function Test-ProtectedLicenseGrant {
+    param([string]$Path, [string]$Code, [int]$Hours)
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
+    $data = Read-ProtectedLicenseData -Path $Path -Purpose 'DEG-KC-LICENSE-GRANT-V1'
+    $valid = $false
+    try {
+        if ($null -eq $data -or $data.version -cne 'KC-GRANT-V1') { return $false }
+        if ([string]$data.deviceCode -cne $Code.Trim().ToUpperInvariant()) { return $false }
+        $issued = [DateTimeOffset]::Parse([string]$data.issuedUtc, [Globalization.CultureInfo]::InvariantCulture)
+        $expires = [DateTimeOffset]::Parse([string]$data.expiresUtc, [Globalization.CultureInfo]::InvariantCulture)
+        $now = [DateTimeOffset]::UtcNow
+        if ($issued -gt $now.AddMinutes(5)) { return $false }
+        if ($expires -le $now) { return $false }
+        if ($expires -le $issued) { return $false }
+        if ($expires -gt $issued.AddHours($Hours).AddMinutes(1)) { return $false }
+        $valid = $true
+        return $true
+    } catch {
+        return $false
+    } finally {
+        if (-not $valid) { Remove-LicenseFile -Path $Path }
+    }
+}
+
+function Get-WindowsBootToken {
+    try {
+        $boot = (Get-CimInstance Win32_OperatingSystem -ErrorAction Stop).LastBootUpTime
+        return ([DateTime]$boot).ToUniversalTime().Ticks.ToString([Globalization.CultureInfo]::InvariantCulture)
+    } catch {
+        $os = Get-WmiObject Win32_OperatingSystem -ErrorAction Stop
+        $boot = [Management.ManagementDateTimeConverter]::ToDateTime([string]$os.LastBootUpTime)
+        return $boot.ToUniversalTime().Ticks.ToString([Globalization.CultureInfo]::InvariantCulture)
+    }
+}
+
+function Write-ProtectedSessionOverride {
+    param([string]$Path, [string]$Code)
+    $data = [pscustomobject]@{
+        version    = 'KC-BOOT-OVERRIDE-V1'
+        deviceCode = $Code.Trim().ToUpperInvariant()
+        bootToken  = Get-WindowsBootToken
+    }
+    Write-ProtectedLicenseData -Data $data -Path $Path -Purpose 'DEG-KC-BOOT-OVERRIDE-V1'
+}
+
+function Test-ProtectedSessionOverride {
+    param([string]$Path, [string]$Code)
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
+    $data = Read-ProtectedLicenseData -Path $Path -Purpose 'DEG-KC-BOOT-OVERRIDE-V1'
+    $valid = $false
+    try {
+        if ($null -eq $data -or $data.version -cne 'KC-BOOT-OVERRIDE-V1') { return $false }
+        if ([string]$data.deviceCode -cne $Code.Trim().ToUpperInvariant()) { return $false }
+        if ([string]$data.bootToken -cne (Get-WindowsBootToken)) { return $false }
+        $valid = $true
+        return $true
+    } catch {
+        return $false
+    } finally {
+        if (-not $valid) { Remove-LicenseFile -Path $Path }
+    }
+}
+
+function Get-RemoteUtf8TextNoCache {
+    param([string]$Url, [string]$UserAgent = 'DEG-License-Check')
+    if ([string]::IsNullOrWhiteSpace($Url)) { throw 'Uzak lisans adresi verilmedi.' }
+    $separator = if ($Url.Contains('?')) { '&' } else { '?' }
+    $fetchUrl = $Url + $separator + 'kc_nonce=' + [DateTime]::UtcNow.Ticks
+    $response = $null
+    $reader = $null
+    try {
+        [Net.ServicePointManager]::SecurityProtocol =
+            [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+        $request = [Net.HttpWebRequest]::Create($fetchUrl)
+        $request.Method = 'GET'
+        $request.Timeout = 10000
+        $request.ReadWriteTimeout = 10000
+        $request.UserAgent = $UserAgent
+        $request.CachePolicy = New-Object Net.Cache.RequestCachePolicy([Net.Cache.RequestCacheLevel]::NoCacheNoStore)
+        $response = $request.GetResponse()
+        $reader = New-Object IO.StreamReader($response.GetResponseStream(), [Text.Encoding]::UTF8, $true)
+        $content = $reader.ReadToEnd()
+        if ($content.Length -gt 8192) { throw 'Uzak lisans yaniti beklenenden buyuk.' }
+        return $content
+    } finally {
+        if ($null -ne $reader) { $reader.Dispose() }
+        if ($null -ne $response) { $response.Dispose() }
+    }
+}
+
+function Test-RemoteDeviceMarker {
+    param([string]$BaseUrl, [string]$Code)
+    if (-not (Test-DeviceCodeFormat -Code $Code)) { return $false }
+    $normalizedCode = $Code.Trim().ToUpperInvariant()
+    $url = $BaseUrl.TrimEnd('/') + '/' + [Uri]::EscapeDataString($normalizedCode + '.lic')
+    try {
+        $content = Get-RemoteUtf8TextNoCache -Url $url -UserAgent 'DEG-Device-License-Check'
+        return $content.Trim() -ceq $normalizedCode
+    } catch [Net.WebException] {
+        if ($null -ne $_.Exception.Response -and [int]$_.Exception.Response.StatusCode -eq 404) {
+            return $false
+        }
+        throw
+    }
+}
+
+function Invoke-DeviceLicenseCheck {
+    param([string]$Code)
+    if (-not (Test-DeviceCodeFormat -Code $Code)) { return 'DENIED|INVALID_DEVICE_CODE' }
+    $normalizedCode = $Code.Trim().ToUpperInvariant()
+
+    if (Test-ProtectedSessionOverride -Path $LicenseOverridePath -Code $normalizedCode) {
+        return 'OK|OVERRIDE'
+    }
+    if (Test-ProtectedLicenseGrant -Path $LicenseGrantPath -Code $normalizedCode -Hours $LicenseGrantHours) {
+        return 'OK|GRANT'
+    }
+
+    try {
+        if (Test-RemoteDeviceMarker -BaseUrl $LicenseMarkerBaseUrl -Code $normalizedCode) {
+            Write-ProtectedLicenseGrant -Path $LicenseGrantPath -Code $normalizedCode -Hours $LicenseGrantHours
+            return 'OK|ONLINE'
+        }
+        return 'DENIED|MARKER_NOT_FOUND'
+    } catch {
+        try {
+            [IO.File]::WriteAllText($LogPath, ($_ | Out-String), (New-Object Text.UTF8Encoding($false)))
+        } catch { }
+        return 'OFFLINE|REMOTE_CHECK_FAILED'
+    }
 }
 
 $script:UpdateWindow = $null
@@ -1328,46 +1602,59 @@ function Show-MessageWindow {
     [void]$window.ShowDialog()
 }
 
-function Get-LicensePasswordFromText {
-    param([string]$Content)
-    if ([string]::IsNullOrEmpty($Content)) { return $null }
-
-    foreach ($line in ($Content -split "`r?`n")) {
-        $colonIndex = $line.IndexOf(':')
-        if ($colonIndex -lt 0) { continue }
-        $label = $line.Substring(0, $colonIndex).Trim().TrimStart([char]0xFEFF)
-        $normalizedLabel = $label.ToUpperInvariant().Replace([char]0x015E, 'S').Replace([char]0x0130, 'I')
-        if ($normalizedLabel -cne 'SIFRE') { continue }
-        $value = $line.Substring($colonIndex + 1).Trim()
-        if (-not [string]::IsNullOrEmpty($value)) { return $value }
-    }
-    return $null
-}
-
-function Get-RemoteLicensePassword {
+function Get-RemoteLicenseVerifier {
     param([string]$Url)
     if ([string]::IsNullOrWhiteSpace($Url)) { return $null }
+    $content = Get-RemoteUtf8TextNoCache -Url $Url -UserAgent 'DEG-Bypass-Verifier-Check'
+    $value = $content.Trim().TrimStart([char]0xFEFF)
+    if ($value -notmatch '^PBKDF2-SHA256\$[0-9]+\$[A-Za-z0-9+/]+={0,2}\$[A-Za-z0-9+/]+={0,2}$') {
+        return $null
+    }
+    return $value
+}
 
-    $separator = if ($Url.Contains('?')) { '&' } else { '?' }
-    $fetchUrl = $Url + $separator + 'kc_nonce=' + [DateTime]::UtcNow.Ticks
-    $response = $null
-    $reader = $null
+function Test-FixedTimeByteArrayEqual {
+    param([byte[]]$Left, [byte[]]$Right)
+    if ($null -eq $Left -or $null -eq $Right -or $Left.Length -ne $Right.Length) { return $false }
+    $difference = 0
+    for ($i = 0; $i -lt $Left.Length; $i++) {
+        $difference = $difference -bor ($Left[$i] -bxor $Right[$i])
+    }
+    return $difference -eq 0
+}
+
+function Test-Pbkdf2Sha256Password {
+    param([string]$Password, [string]$Verifier)
+    if ([string]::IsNullOrEmpty($Password) -or [string]::IsNullOrWhiteSpace($Verifier)) { return $false }
+
+    $derived = $null
+    $expected = $null
+    $salt = $null
+    $pbkdf2 = $null
     try {
-        [Net.ServicePointManager]::SecurityProtocol =
-            [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
-        $request = [Net.HttpWebRequest]::Create($fetchUrl)
-        $request.Method = 'GET'
-        $request.Timeout = 10000
-        $request.ReadWriteTimeout = 10000
-        $request.UserAgent = 'DEG-License-Check'
-        $request.CachePolicy = New-Object Net.Cache.RequestCachePolicy([Net.Cache.RequestCacheLevel]::NoCacheNoStore)
-        $response = $request.GetResponse()
-        $reader = New-Object IO.StreamReader($response.GetResponseStream(), [Text.Encoding]::UTF8, $true)
-        $content = $reader.ReadToEnd()
-        return Get-LicensePasswordFromText -Content $content
+        $parts = $Verifier.Trim().Split('$')
+        if ($parts.Count -ne 4 -or $parts[0] -cne 'PBKDF2-SHA256') { return $false }
+        $iterations = 0
+        if (-not [int]::TryParse($parts[1], [ref]$iterations)) { return $false }
+        if ($iterations -lt 100000 -or $iterations -gt 5000000) { return $false }
+        $salt = [Convert]::FromBase64String($parts[2])
+        $expected = [Convert]::FromBase64String($parts[3])
+        if ($salt.Length -lt 16 -or $expected.Length -lt 32 -or $expected.Length -gt 64) { return $false }
+
+        $pbkdf2 = [Security.Cryptography.Rfc2898DeriveBytes]::new(
+            $Password,
+            $salt,
+            $iterations,
+            [Security.Cryptography.HashAlgorithmName]::SHA256)
+        $derived = $pbkdf2.GetBytes($expected.Length)
+        return Test-FixedTimeByteArrayEqual -Left $derived -Right $expected
+    } catch {
+        return $false
     } finally {
-        if ($null -ne $reader) { $reader.Dispose() }
-        if ($null -ne $response) { $response.Dispose() }
+        if ($null -ne $pbkdf2) { $pbkdf2.Dispose() }
+        if ($null -ne $derived) { [Array]::Clear($derived, 0, $derived.Length) }
+        if ($null -ne $expected) { [Array]::Clear($expected, 0, $expected.Length) }
+        if ($null -ne $salt) { [Array]::Clear($salt, 0, $salt.Length) }
     }
 }
 
@@ -1442,16 +1729,24 @@ function Show-LicenseWindow {
         $accept.IsEnabled = $false
         $status.Text = 'Sifre kontrol ediliyor...'
         try {
-            $remotePassword = Get-RemoteLicensePassword -Url $PasswordUrl
-            if ([string]::IsNullOrEmpty($remotePassword)) {
-                $status.Text = 'Bypass sifresi bulunamadi.'
-            } elseif ($password.Password.Trim() -ceq $remotePassword) {
-                & $writeResult 'OK'
-                $window.Close()
+            $remoteVerifier = Get-RemoteLicenseVerifier -Url $PasswordUrl
+            if ([string]::IsNullOrEmpty($remoteVerifier)) {
+                $status.Text = 'Bypass dogrulama degeri bulunamadi.'
             } else {
-                $status.Text = 'Sifre yanlis.'
-                $password.Clear()
-                $password.Focus()
+                $candidate = $password.Password
+                try {
+                    if (Test-Pbkdf2Sha256Password -Password $candidate -Verifier $remoteVerifier) {
+                        Write-ProtectedSessionOverride -Path $LicenseOverridePath -Code $DeviceCode
+                        & $writeResult 'OK'
+                        $window.Close()
+                    } else {
+                        $status.Text = 'Sifre yanlis.'
+                        $password.Clear()
+                        $password.Focus()
+                    }
+                } finally {
+                    $candidate = $null
+                }
             }
         } catch {
             $status.Text = 'Sifre kontrolune ulasilamadi. Internet baglantisini kontrol edin.'
@@ -1475,6 +1770,11 @@ function Show-LicenseWindow {
 if ($Mode -eq 'DeviceCode') {
     $code = Get-OrCreateDeviceCode -Path $DeviceCodePath
     Write-UpdateResult ('OK|' + $code)
+    exit 0
+}
+
+if ($Mode -eq 'LicenseCheck') {
+    Write-UpdateResult (Invoke-DeviceLicenseCheck -Code $DeviceCode)
     exit 0
 }
 
@@ -2189,8 +2489,12 @@ $saveButton.Add_Click({
 
 $closeButton.Add_Click({ $window.Close() })
 
-$lastStatusWrite = 0L
-$lastShowWrite = 0L
+$script:lastStatusWrite = if (Test-Path -LiteralPath $statusPath) {
+    (Get-Item -LiteralPath $statusPath).LastWriteTimeUtc.Ticks
+} else { 0L }
+$script:lastShowWrite = if (Test-Path -LiteralPath $showPath) {
+    (Get-Item -LiteralPath $showPath).LastWriteTimeUtc.Ticks
+} else { 0L }
 $pollTimer = New-Object Windows.Threading.DispatcherTimer
 $pollTimer.Interval = [TimeSpan]::FromMilliseconds(350)
 $pollTimer.Add_Tick({
