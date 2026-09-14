@@ -1441,6 +1441,7 @@ public static class DEGWindowsUiFocus {
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
     [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr hWnd);
     [DllImport("user32.dll")] public static extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow);
+    [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hWnd);
     [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
     [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
 }
@@ -1492,7 +1493,10 @@ function Get-CadWindowHandle {
 function Focus-CadWindow {
     $handle = Get-CadWindowHandle
     if ($handle -eq [IntPtr]::Zero) { return $false }
-    [void][DEGWindowsUiFocus]::ShowWindowAsync($handle, 9)
+    # Restore only minimized windows; leave maximized and normal sizes unchanged.
+    if ([DEGWindowsUiFocus]::IsIconic($handle)) {
+        [void][DEGWindowsUiFocus]::ShowWindowAsync($handle, 9)
+    }
     [void][DEGWindowsUiFocus]::BringWindowToTop($handle)
     return [DEGWindowsUiFocus]::SetForegroundWindow($handle)
 }
