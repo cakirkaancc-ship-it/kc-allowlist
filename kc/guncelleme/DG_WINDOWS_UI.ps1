@@ -2221,6 +2221,21 @@ function Render-Rows {
     $category = [string]$categoryList.SelectedItem
     $pageName = if ($pageTitles.ContainsKey($category)) { [string]$pageTitles[$category] } else { $category + ' Ayarlari' }
     $pageTitle.Text = 'DO - ' + $pageName
+    if ($category -eq 'DN') {
+        $clearSerials = New-Object Windows.Controls.Button
+        $clearSerials.Content = 'Plandaki Tum SIRA_NO Degerlerini Temizle'
+        $clearSerials.HorizontalAlignment = 'Left'
+        $clearSerials.Padding = '12,8'
+        $clearSerials.Margin = '0,0,0,12'
+        $clearSerials.Add_Click({
+            if (Send-CadCommand 'DO_DN_CLEAR_SIRA') {
+                $statusText.Text = 'SIRA_NO temizleme komutu CAD uygulamasina gonderildi.'
+            } else {
+                $statusText.Text = 'CAD uygulamasina baglanilamadi.'
+            }
+        })
+        [void]$propertyPanel.Children.Add($clearSerials)
+    }
     $search = $searchBox.Text.Trim()
     $visible = @($script:rows | Where-Object {
         (Test-RowOnPage $_ $category) -and
