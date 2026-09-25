@@ -424,8 +424,8 @@ function Get-RemoteUtf8TextNoCache {
             [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
         $request = [Net.HttpWebRequest]::Create($fetchUrl)
         $request.Method = 'GET'
-        $request.Timeout = 10000
-        $request.ReadWriteTimeout = 10000
+        $request.Timeout = 60000
+        $request.ReadWriteTimeout = 60000
         $request.UserAgent = $UserAgent
         $request.CachePolicy = New-Object Net.Cache.RequestCachePolicy([Net.Cache.RequestCacheLevel]::NoCacheNoStore)
         $response = $request.GetResponse()
@@ -1937,6 +1937,7 @@ function Get-FriendlyWords {
 }
 
 $configLabels = @{
+    'CMD_DNN' = 'DNN - SIRA_NO Yazi Yerlesimi'
     'DD_OFFSET' = 'Ofset'
     'DD_AGIZ_ARAMA' = 'Ana Hat Agiz Arama Mesafesi'
     'DD_BLOK_YAKINLIK' = 'Blok Yakinlik Mesafesi'
@@ -1950,6 +1951,7 @@ $configLabels = @{
     'DC_DOWN_LEN' = 'Asagi Mesafe'
     'DC_FILLET_R' = 'Fillet'
     'PLAN_UNIT' = 'Olcu Birimi'
+    'PLAN_UNIT_LOCK' = 'Kilit'
     'DO_KAYIT_PATH' = 'Dosya Lokasyonu'
     'DG_EXTRA_LIGHTING_LAYERS' = 'Ek Layerlar'
     'DG_KIT_LAYER' = 'Kit Sinyal Hatlari'
@@ -2033,6 +2035,7 @@ $configLabels = @{
     'DN_BLOCK_TOL' = 'DN Block'
     'DN_DOSEME_TOL' = 'DN Doseme'
     'DN_MODL_TOL' = 'DN MODL'
+    'DK_TAG_TOL' = 'DK Tag Tolu'
     'DW_TOUCH_TOL' = 'DW Temas'
     'DR_TREE_TOL' = 'DR Agac'
 }
@@ -2298,6 +2301,15 @@ function Render-Rows {
                     Set-RowValue $currentRow '1' 'ACTION'
                     $statusText.Text = 'Islem Kaydet ile uygulanacak.'
                     $statusText.Foreground = '#374151'
+                }.GetNewClosure())
+            } elseif ($row.Type -eq 'BOOL') {
+                $control = New-Object Windows.Controls.CheckBox
+                $control.VerticalAlignment = 'Center'
+                $control.IsChecked = ([string]$row.Value -eq '1')
+                $currentRow = $row
+                $control.Add_Click({
+                    $value = if ($this.IsChecked) { '1' } else { '0' }
+                    Set-RowValue $currentRow $value 'SET'
                 }.GetNewClosure())
             } elseif ($row.Type -eq 'CHOICE') {
                 $control = New-Object Windows.Controls.ComboBox
