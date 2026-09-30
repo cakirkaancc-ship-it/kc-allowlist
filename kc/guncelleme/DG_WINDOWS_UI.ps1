@@ -1936,6 +1936,36 @@ function Get-FriendlyWords {
     return $culture.TextInfo.ToTitleCase($text.ToLower($culture))
 }
 
+$commandHelp = @{
+    'CMD_DG' = @('Hat ve blok baglantilarindan metraj ve adet kesfi hazirlar.', 'Aydinlatma, priz, UPS, data/fiber, TV, telefon, kartli gecis')
+    'CMD_DGT' = @('DG algilamasini zincir, tolerans ve sorti isaretleriyle cizimde gosterir.', 'Aydinlatma, priz, UPS, data/fiber, TV, telefon, kartli gecis')
+    'CMD_DN' = @('Hatta bagli bloklarin SIRA_NO degerlerini baglanti sirasina gore numaralandirir.', 'Yangin, flasor, seslendirme, data, TV, telefon, CCTV, kartli gecis')
+    'CMD_DNN' = @('SIRA_NO yazilarini plan acisina cevirir; temas varsa yakin bos yere tasir.', 'SIRA_NO attribute bulunan secili bloklar; tum sistemler')
+    'CMD_DA' = @('Ana hattan secili ic sembollere veya kameralara filletli baglanti cizer. Data/TV/telefonda adede gore normal/multi layer secer.', 'Data, TV, telefon, CCTV')
+    'CMD_DK' = @('Secili alandaki hat ve bloklardan katlara ayrilmis kolon semasi cizer.', 'Yangin, flasor, seslendirme, data, TV, telefon, CCTV, kartli gecis')
+    'CMD_DKK' = @('DK semasinda ayni sembolleri tek gosterip ADET degerlerini toplar.', 'Yangin, flasor, seslendirme, data, TV, telefon, CCTV, kartli gecis')
+    'CMD_DP' = @('Tiklanan noktadan hat metrajini hesaplar; data/TV/telefon icin uc adetlerini de verir.', 'Aydinlatma, priz, UPS, data, TV, telefon, CCTV, kartli gecis; genel egri uzunlugu')
+    'CMD_DD' = @('Secilen ana hatti secili bloklara baglayarak loop cizer.', 'Blok ve polyline ile cizilen looplar; yangin, flasor, seslendirme ve benzeri')
+    'CMD_DF' = @('Tiklanan polyline segmentini esas alip secili bloklara loop baglantisi cizer.', 'Blok ve polyline ile cizilen looplar; yangin, flasor, seslendirme ve benzeri')
+    'CMD_DR' = @('Ana hattan mesafeli yeni hat uretir; ardindan secili bloklari DZ ile baglar.', 'Polyline ve blok tabanli loop cizimleri')
+    'CMD_DZ' = @('Ana hattan ofsetli loop olusturup secili bloklara baglar.', 'Blok ve polyline ile cizilen looplar; yangin, flasor, seslendirme ve benzeri')
+    'CMD_DW' = @('Secili blok adetlerini ve hat uzunluklarini kesif CSV dosyasina aktarir.', 'Secili elektrik bloklari ve hatlari; tum sistemler')
+    'CMD_DM' = @('Mahal mahal secilen bloklarin adet kesfini CSV dosyasina aktarir.', 'Secili elektrik bloklari; tum sistemler')
+    'CMD_DS' = @('E_ bloklarindan sembol ve adet listesi olusturur.', 'E_ isimli elektrik bloklari; tum sistemler')
+    'CMD_DT' = @('Tava guzergahi, genisligi ve kotuna gore tava ve donus elemanlarini cizer.', 'Kuvvetli akim ve zayif akim kablo tavalari')
+    'CMD_DTM' = @('Tava uzunluklarini ve donus elemanlarinin adetlerini hesaplar.', 'Kablo tavalari')
+    'CMD_DTT' = @('Tava etiket bloklarini ve baglanti cizgilerini olusturur.', 'Kablo tavalari')
+    'CMD_DO' = @('Komut, layer, blok, tolerans, birim ve kayit ayarlarini acar.', 'Tum DEG sistemleri')
+    'CMD_UCS' = @('AutoCAD kullanici koordinat sistemini duzenler.', 'Tum cizimler')
+}
+
+function Get-CommandHelpText {
+    param($Row)
+    $key = [string]$Row.Key
+    if ($commandHelp.ContainsKey($key)) { return $commandHelp[$key] -join ' ' }
+    return ''
+}
+
 $configLabels = @{
     'CMD_DNN' = 'DNN - SIRA_NO Yazi Yerlesimi'
     'DD_OFFSET' = 'Ofset'
@@ -2063,6 +2093,7 @@ $pageTitles = @{
 function Get-DisplayLabel {
     param($Row)
     $key = [string]$Row.Key
+    if ($key -match '^CMD_(.+)$') { return $Matches[1] }
     if ($configLabels.ContainsKey($key)) { return [string]$configLabels[$key] }
     if ($Row.Kind -eq 'CODE') {
         $type = ([string]$Row.Label).Split('-')[-1].Trim()
@@ -2248,6 +2279,7 @@ function Render-Rows {
         (Test-RowOnPage $_ $category) -and
         ([string]::IsNullOrWhiteSpace($search) -or
          (Get-DisplayLabel $_).IndexOf($search, [StringComparison]::OrdinalIgnoreCase) -ge 0 -or
+         (Get-CommandHelpText $_).IndexOf($search, [StringComparison]::OrdinalIgnoreCase) -ge 0 -or
          (Get-RowSection $_ $category).IndexOf($search, [StringComparison]::OrdinalIgnoreCase) -ge 0 -or
          $_.Key.IndexOf($search, [StringComparison]::OrdinalIgnoreCase) -ge 0)
     })
@@ -2279,8 +2311,30 @@ function Render-Rows {
             $border.BorderThickness = '0,0,0,1'
             $border.Padding = '8,7'
             $grid = New-Object Windows.Controls.Grid
-            [void]$grid.ColumnDefinitions.Add((New-Object Windows.Controls.ColumnDefinition -Property @{ Width = '255' }))
-            [void]$grid.ColumnDefinitions.Add((New-Object Windows.Controls.ColumnDefinition -Property @{ Width = '*' }))
+            $isCommand = $category -eq 'KOMUTLAR' -and $commandHelp.ContainsKey([string]$row.Key)
+            if ($isCommand) {
+                [void]$grid.ColumnDefinitions.Add((New-Object Windows.Controls.ColumnDefinition -Property @{ Width = '70' }))
+                [void]$grid.ColumnDefinitions.Add((New-Object Windows.Controls.ColumnDefinition -Property @{ Width = '110' }))
+                [void]$grid.ColumnDefinitions.Add((New-Object Windows.Controls.ColumnDefinition -Property @{ Width = '*' }))
+                $helpPanel = New-Object Windows.Controls.StackPanel
+                $helpPanel.Margin = '14,0,3,0'
+                $description = New-Object Windows.Controls.TextBlock
+                $description.Text = $commandHelp[[string]$row.Key][0]
+                $description.TextWrapping = 'Wrap'
+                $description.Foreground = '#1F2937'
+                [void]$helpPanel.Children.Add($description)
+                $systems = New-Object Windows.Controls.TextBlock
+                $systems.Text = 'Sistemler: ' + $commandHelp[[string]$row.Key][1]
+                $systems.TextWrapping = 'Wrap'
+                $systems.Foreground = '#4B5563'
+                $systems.Margin = '0,4,0,0'
+                [void]$helpPanel.Children.Add($systems)
+                [Windows.Controls.Grid]::SetColumn($helpPanel, 2)
+                [void]$grid.Children.Add($helpPanel)
+            } else {
+                [void]$grid.ColumnDefinitions.Add((New-Object Windows.Controls.ColumnDefinition -Property @{ Width = '255' }))
+                [void]$grid.ColumnDefinitions.Add((New-Object Windows.Controls.ColumnDefinition -Property @{ Width = '*' }))
+            }
             $label = New-Object Windows.Controls.TextBlock
             $label.Text = Get-DisplayLabel $row
             $label.VerticalAlignment = 'Center'
