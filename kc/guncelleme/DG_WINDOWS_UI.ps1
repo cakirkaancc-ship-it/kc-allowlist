@@ -1,4 +1,4 @@
-param(
+﻿param(
     [Parameter(Mandatory = $true)]
     [string]$StatePath,
     [string]$PasswordUrl = '',
@@ -1937,6 +1937,7 @@ function Get-FriendlyWords {
 }
 
 $commandHelp = @{
+    'CMD_DY' = @('Once secilen blogu birden fazla alana yerlestirir; yaricap ve duvar toleransi DO > DY sayfasindan ayarlanir.', 'Secilen blok; genel plan yerlesimi')
     'CMD_DG' = @('Hat ve blok baglantilarindan metraj ve adet kesfi hazirlar.', 'Aydinlatma, priz, UPS, data/fiber, TV, telefon, kartli gecis')
     'CMD_DGT' = @('DG algilamasini zincir, tolerans ve sorti isaretleriyle cizimde gosterir.', 'Aydinlatma, priz, UPS, data/fiber, TV, telefon, kartli gecis')
     'CMD_DN' = @('Hatta bagli bloklarin SIRA_NO degerlerini baglanti sirasina gore numaralandirir.', 'Yangin, flasor, seslendirme, data, TV, telefon, CCTV, kartli gecis')
@@ -2076,6 +2077,7 @@ $pageTitles = @{
     'DGT' = 'DGT Renk ve Reset Ayarlari'
     'DN' = 'DN Numaralandirma ve Filtreler'
     'DK' = 'DK Kopyalama ve Cizim Ayarlari'
+    'DY' = 'DY Blok Yerlesim Ayarlari'
     'DP' = 'DP Metraj ve Layer Ayarlari'
     'BLOCKLAR' = 'DP Block Katsayilari'
     'DZ' = 'DZ Cizim Ayarlari'
