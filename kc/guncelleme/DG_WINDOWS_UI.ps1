@@ -1937,7 +1937,7 @@ function Get-FriendlyWords {
 }
 
 $commandHelp = @{
-    'CMD_DY' = @('Once secilen blogu birden fazla alana yerlestirir; yaricap ve duvar toleransi DO > DY sayfasindan ayarlanir.', 'Secilen blok; genel plan yerlesimi')
+    'CMD_DY' = @('Once secilen blogu birden fazla alana yerlestirir. Mimari modunda XREF/blok/duvarlardan oda adaylari bulup onaylatir; yaricap ve tolerans DY sayfasindadir.', 'Secilen blok; genel plan yerlesimi')
     'CMD_DG' = @('Hat ve blok baglantilarindan metraj ve adet kesfi hazirlar.', 'Aydinlatma, priz, UPS, data/fiber, TV, telefon, kartli gecis')
     'CMD_DGT' = @('DG algilamasini zincir, tolerans ve sorti isaretleriyle cizimde gosterir.', 'Aydinlatma, priz, UPS, data/fiber, TV, telefon, kartli gecis')
     'CMD_DN' = @('Hatta bagli bloklarin SIRA_NO degerlerini baglanti sirasina gore numaralandirir.', 'Yangin, flasor, seslendirme, data, TV, telefon, CCTV, kartli gecis')
