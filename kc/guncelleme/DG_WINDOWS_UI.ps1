@@ -1987,6 +1987,7 @@ $configLabels = @{
     'DG_EXTRA_LIGHTING_LAYERS' = 'Ek Layerlar'
     'DG_KIT_LAYER' = 'Kit Sinyal Hatlari'
     'DG_ANAHTAR_LAYER' = 'Anahtar Hatlari'
+    'DGT_GAP_MARGIN_MM' = 'DG Temas Toleransina Ek Pay (mm)'
     'DGT_CHAIN_COLOR' = 'Zincir Polyline Rengi'
     'DGT_TOL_SMALL_COLOR' = 'Tol <= 7 Cember Rengi'
     'DGT_TOL_BIG_COLOR' = 'Tol > 7 Cember Rengi'
@@ -2074,7 +2075,7 @@ $configLabels = @{
 $pageTitles = @{
     'PLAN' = 'Plan ve Olcu Birimi'
     'DG' = 'DG Hat ve Layer Ayarlari'
-    'DGT' = 'DGT Renk ve Reset Ayarlari'
+    'DGT' = 'DGT Sorun Kontrol Ayarlari'
     'DN' = 'DN Numaralandirma ve Filtreler'
     'DK' = 'DK Kopyalama ve Cizim Ayarlari'
     'DY' = 'DY Blok Yerlesim Ayarlari'
@@ -2171,6 +2172,7 @@ function Get-RowSection {
         }
         'DGT' {
             if ($Row.Kind -eq 'ACTION') { return 'DGT Islemleri' }
+            if ($key -eq 'DGT_GAP_MARGIN_MM') { return 'Kopukluk Aramasi' }
             return 'DGT Renkleri'
         }
         'DN' {
