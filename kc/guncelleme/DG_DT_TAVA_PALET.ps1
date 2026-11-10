@@ -46,7 +46,7 @@ function Write-State {
     if ($dir -and -not (Test-Path -LiteralPath $dir)) {
         [IO.Directory]::CreateDirectory($dir) | Out-Null
     }
-    $keys = @('MODE','WIDTH','SIDE','HEIGHT','LADDER_BOTTOM','ELEVATION_ANGLE','THREE_D','TYPE_OPTIONS','WIDTH_OPTIONS','SIDE_OPTIONS','HEIGHT_OPTIONS','CLOSED','PID')
+    $keys = @('MODE','WIDTH','SIDE','HEIGHT','LADDER_BOTTOM','ELEVATION_ANGLE','THREE_D','HATCH_ENABLED','WARNINGS_ENABLED','TYPE_OPTIONS','WIDTH_OPTIONS','SIDE_OPTIONS','HEIGHT_OPTIONS','CLOSED','PID')
     $lines = New-Object System.Collections.Generic.List[string]
     foreach ($key in $keys) {
         if ($State.ContainsKey($key)) {
@@ -128,7 +128,13 @@ $xaml = @'
     <TextBlock Grid.Row="6" Grid.Column="0" Text="Elevation Esik Acisi" VerticalAlignment="Center" Margin="0,0,10,10"/>
     <TextBox x:Name="ElevationAngleBox" Grid.Row="6" Grid.Column="1" Height="30" Margin="0,0,0,10" Padding="6,3"/>
     <TextBlock Grid.Row="7" Grid.Column="0" Text="Gorunum" VerticalAlignment="Center" Margin="0,0,10,10"/>
-    <CheckBox x:Name="ThreeDBox" Grid.Row="7" Grid.Column="1" Content="3D (Tum Cizim)" VerticalAlignment="Center" Margin="0,0,0,10"/>
+    <StackPanel Grid.Row="7" Grid.Column="1" Margin="0,0,0,10">
+      <StackPanel Orientation="Horizontal">
+      <CheckBox x:Name="ThreeDBox" Content="3D (Tum Cizim)" VerticalAlignment="Center" Margin="0,0,18,0"/>
+      <CheckBox x:Name="HatchBox" Content="Hatch" VerticalAlignment="Center"/>
+      </StackPanel>
+      <CheckBox x:Name="WarningsBox" Content="Baglanti uyarilari" Margin="0,8,0,0"/>
+    </StackPanel>
     <TextBlock x:Name="StatusText" Grid.Row="8" Grid.ColumnSpan="2" Text="Hazir" Foreground="#166534" VerticalAlignment="Top" Margin="0,4,0,8" TextWrapping="Wrap"/>
     <StackPanel Grid.Row="9" Grid.ColumnSpan="2" Orientation="Horizontal" HorizontalAlignment="Right">
       <Button x:Name="LadderButton" Content="Merdiven" Width="100" Height="34" Margin="0,0,8,0"/>
@@ -149,6 +155,8 @@ $heightBox = $window.FindName('HeightBox')
 $ladderBottomBox = $window.FindName('LadderBottomBox')
 $elevationAngleBox = $window.FindName('ElevationAngleBox')
 $threeDBox = $window.FindName('ThreeDBox')
+$hatchBox = $window.FindName('HatchBox')
+$warningsBox = $window.FindName('WarningsBox')
 $statusText = $window.FindName('StatusText')
 $ladderButton = $window.FindName('LadderButton')
 $mergeButton = $window.FindName('MergeButton')
@@ -203,6 +211,8 @@ $heightBox.Text = [string]$state['HEIGHT']
 $ladderBottomBox.Text = [string]$state['LADDER_BOTTOM']
 $elevationAngleBox.Text = $(if ([string]::IsNullOrWhiteSpace([string]$state['ELEVATION_ANGLE'])) { '45' } else { [string]$state['ELEVATION_ANGLE'] })
 $threeDBox.IsChecked = ([string]$state['THREE_D'] -ne '0')
+$hatchBox.IsChecked = ([string]$state['HATCH_ENABLED'] -ne '0')
+$warningsBox.IsChecked = ([string]$state['WARNINGS_ENABLED'] -ne '0')
 
 function Set-ModeValue {
     param([string]$Value)
@@ -374,7 +384,13 @@ $pollTimer.Add_Tick({
         Sync-TypeOptions $current
         $context = [string]$current['CONTEXT']
         $selectionActive = ($context -eq 'SELECT' -and [string]$current['SELECTION_ACTIVE'] -eq '1')
-        $stateKey = $context + '|' + [string]$current['SELECTION_ACTIVE'] + '|' + [string]$current['SELECTION_REV'] + '|' + [string]$current['THREE_D']
+        $stateKey = $context + '|' + [string]$current['SELECTION_ACTIVE'] + '|' + [string]$current['SELECTION_REV'] + '|' + [string]$current['THREE_D'] + '|' + [string]$current['HATCH_ENABLED']
+        $script:suppressHatchChange = $true
+        try { $hatchBox.IsChecked = ([string]$current['HATCH_ENABLED'] -ne '0') }
+        finally { $script:suppressHatchChange = $false }
+        $script:suppressWarningsChange = $true
+        try { $warningsBox.IsChecked = ([string]$current['WARNINGS_ENABLED'] -ne '0') }
+        finally { $script:suppressWarningsChange = $false }
         if ($stateKey -ne $lastPanelStateKey) {
             if ($selectionActive) {
                 Set-PanelValues $current 'SELECTION_'
@@ -438,6 +454,46 @@ function Request-GlobalThreeD {
 
 $threeDBox.Add_Checked({ Request-GlobalThreeD })
 $threeDBox.Add_Unchecked({ Request-GlobalThreeD })
+
+function Request-GlobalHatch {
+    if ($script:suppressHatchChange) { return }
+    $current = Read-State $StatePath
+    $current['HATCH_ENABLED'] = $(if ($hatchBox.IsChecked -eq $true) { '1' } else { '0' })
+    $current['REQUEST'] = 'GLOBAL_HATCH'
+    $current['REQUEST_ID'] = [string][DateTime]::UtcNow.Ticks
+    $current['REQUEST_DONE'] = ''
+    $current['STATUS'] = 'Hatch gorunumu guncelleniyor...'
+    Write-State $current
+    $statusText.Text = $current['STATUS']
+    if (-not (Send-CadCommand 'DT_PALETTE_HATCH' -CancelCurrent -Silent)) {
+        $statusText.Text = 'Hatch komutu CAD icinde baslatilamadi.'
+        $current['REQUEST'] = ''
+        $current['HATCH_ENABLED'] = $(if ($hatchBox.IsChecked -eq $true) { '0' } else { '1' })
+        $current['STATUS'] = $statusText.Text
+        Write-State $current
+    }
+}
+$hatchBox.Add_Checked({ Request-GlobalHatch })
+$hatchBox.Add_Unchecked({ Request-GlobalHatch })
+
+function Request-Warnings {
+    if ($script:suppressWarningsChange) { return }
+    $current = Read-State $StatePath
+    $current['WARNINGS_ENABLED'] = $(if ($warningsBox.IsChecked -eq $true) { '1' } else { '0' })
+    $current['REQUEST'] = 'WARNINGS'
+    $current['REQUEST_ID'] = [string][DateTime]::UtcNow.Ticks
+    $current['REQUEST_DONE'] = ''
+    Write-State $current
+    if (-not (Send-CadCommand 'DT_PALETTE_WARNINGS' -CancelCurrent -Silent)) {
+        $current['WARNINGS_ENABLED'] = $(if ($warningsBox.IsChecked -eq $true) { '0' } else { '1' })
+        $current['REQUEST'] = ''
+        $current['STATUS'] = 'Baglanti uyari ayari CAD icinde uygulanamadi.'
+        $statusText.Text = $current['STATUS']
+        Write-State $current
+    }
+}
+$warningsBox.Add_Checked({ Request-Warnings })
+$warningsBox.Add_Unchecked({ Request-Warnings })
 
 $mergeButton.Add_Click({
     $current = Read-State $StatePath
