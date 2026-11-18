@@ -1955,7 +1955,7 @@ $commandHelp = @{
     'CMD_DS' = @('E_ bloklarindan sembol ve adet listesi olusturur.', 'E_ isimli elektrik bloklari; tum sistemler')
     'CMD_DT' = @('Tava guzergahi, genisligi ve kotuna gore tava ve donus elemanlarini cizer.', 'Kuvvetli akim ve zayif akim kablo tavalari')
     'CMD_DTM' = @('Tava uzunluklarini ve donus elemanlarinin adetlerini hesaplar.', 'Kablo tavalari')
-    'CMD_DTT' = @('Tava etiket bloklarini ve baglanti cizgilerini olusturur.', 'Kablo tavalari')
+    'CMD_DTT' = @('Tava etiketlerini olusturur; tekrar calistirildiginda secilen tavalardaki mevcut etiketlerin yerlerini kaydirip duzenler.', 'Kablo tavalari ve tava etiketleri')
     'CMD_DO' = @('Komut, layer, blok, tolerans, birim ve kayit ayarlarini acar.', 'Tum DEG sistemleri')
     'CMD_UCS' = @('AutoCAD kullanici koordinat sistemini duzenler.', 'Tum cizimler')
 }
