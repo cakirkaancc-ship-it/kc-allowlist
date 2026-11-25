@@ -350,7 +350,7 @@ function Write-ProtectedLicenseGrant {
 }
 
 function Test-ProtectedLicenseGrant {
-    param([string]$Path, [string]$Code, [int]$Hours)
+    param([string]$Path, [string]$Code, [int]$Hours, [switch]$KeepInvalid)
     if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
     $data = Read-ProtectedLicenseData -Path $Path -Purpose 'DEG-KC-LICENSE-GRANT-V1'
     $valid = $false
@@ -369,7 +369,7 @@ function Test-ProtectedLicenseGrant {
     } catch {
         return $false
     } finally {
-        if (-not $valid) { Remove-LicenseFile -Path $Path }
+        if (-not $valid -and -not $KeepInvalid) { Remove-LicenseFile -Path $Path }
     }
 }
 
@@ -463,22 +463,37 @@ function Invoke-DeviceLicenseCheck {
     if (Test-ProtectedSessionOverride -Path $LicenseOverridePath -Code $normalizedCode) {
         return 'OK|OVERRIDE'
     }
-    if (Test-ProtectedLicenseGrant -Path $LicenseGrantPath -Code $normalizedCode -Hours $LicenseGrantHours) {
+    # DPAPI grants are user-specific; the device identity remains machine-wide.
+    $grant = $LicenseGrantPath
+    if ($env:LOCALAPPDATA -and $env:ProgramData -and
+        $LicenseGrantPath -ieq [IO.Path]::Combine($env:ProgramData,'KC','license.grant')) {
+        $grant = [IO.Path]::Combine($env:LOCALAPPDATA,'DEG','license.grant')
+    }
+    if (Test-ProtectedLicenseGrant -Path $grant -Code $normalizedCode -Hours $LicenseGrantHours) {
+        return 'OK|GRANT'
+    }
+    if ($grant -ine $LicenseGrantPath -and
+        (Test-ProtectedLicenseGrant -Path $LicenseGrantPath -Code $normalizedCode -Hours $LicenseGrantHours -KeepInvalid)) {
         return 'OK|GRANT'
     }
 
     try {
-        if (Test-RemoteDeviceMarker -BaseUrl $LicenseMarkerBaseUrl -Code $normalizedCode) {
-            Write-ProtectedLicenseGrant -Path $LicenseGrantPath -Code $normalizedCode -Hours $LicenseGrantHours
-            return 'OK|ONLINE'
+        if (-not (Test-RemoteDeviceMarker -BaseUrl $LicenseMarkerBaseUrl -Code $normalizedCode)) {
+            return 'DENIED|MARKER_NOT_FOUND'
         }
-        return 'DENIED|MARKER_NOT_FOUND'
     } catch {
         try {
             [IO.File]::WriteAllText($LogPath, ($_ | Out-String), (New-Object Text.UTF8Encoding($false)))
         } catch { }
         return 'OFFLINE|REMOTE_CHECK_FAILED'
     }
+    try {
+        Write-ProtectedLicenseGrant -Path $grant -Code $normalizedCode -Hours $LicenseGrantHours
+    } catch {
+        try { [IO.File]::WriteAllText($LogPath, "Lisans dogrulandi; yerel kayit yazilamadi: $grant" + [Environment]::NewLine + ($_ | Out-String)) } catch { }
+        return 'OK|ONLINE_NO_CACHE'
+    }
+    return 'OK|ONLINE'
 }
 
 $script:UpdateWindow = $null
