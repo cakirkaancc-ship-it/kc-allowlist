@@ -1970,6 +1970,7 @@ $commandHelp = @{
     'CMD_DS' = @('E_ bloklarindan sembol ve adet listesi olusturur.', 'E_ isimli elektrik bloklari; tum sistemler')
     'CMD_DT' = @('Tava guzergahi, genisligi ve kotuna gore tava ve donus elemanlarini cizer.', 'Kuvvetli akim ve zayif akim kablo tavalari')
     'CMD_DTM' = @('Tava uzunluklarini ve donus elemanlarinin adetlerini hesaplar.', 'Kablo tavalari')
+    'CMD_DB' = @('Secilen alandaki dinamik bloklarin gorunurluk, tip, olcu, konum ve yon parametrelerini yeniler. Yedekle, aktarmadan once her referansin degerlerini saklar; Onar bu degerleri geri uygular.', 'Dinamik bloklar; kilitli layer ve XREF haric')
     'CMD_DPP' = @('Modelde secilen layerlardaki dikdortgen cerceveleri bloklar dahil bulur ve secilen sayfa ayariyla ayri PDF dosyalarina yazar.', 'PDF ve pafta ciktisi')
     'CMD_DTT' = @('Tava etiketlerini olusturur; tekrar calistirildiginda secilen tavalardaki mevcut etiketlerin yerlerini kaydirip duzenler.', 'Kablo tavalari ve tava etiketleri')
     'CMD_DO' = @('Komut, layer, blok, tolerans, birim ve kayit ayarlarini acar.', 'Tum DEG sistemleri')
